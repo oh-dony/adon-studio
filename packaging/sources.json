@@ -1,0 +1,438 @@
+{
+ "_comment": "Pacotes publicados na Loja. 'dirs' são as pastas instaladas; 'from' é onde elas estão na máquina que gera os pacotes.",
+ "items": [
+  {
+   "id": "catppuccin-gtk",
+   "kind": "gtk",
+   "title": "Catppuccin",
+   "author": "Fausto-Korpsvart",
+   "license": "GPL-3.0",
+   "source": "https://github.com/Fausto-Korpsvart/Catppuccin-GTK-Theme",
+   "from": "~/.themes",
+   "dirs": [
+    "Catppuccin-Mauve-Dark",
+    "Catppuccin-Pink-Dark",
+    "Catppuccin-Blue-Dark",
+    "Catppuccin-Green-Dark",
+    "Catppuccin-Lavender-Dark",
+    "Catppuccin-Peach-Dark"
+   ]
+  },
+  {
+   "id": "tokyonight-gtk",
+   "kind": "gtk",
+   "title": "Tokyo Night",
+   "author": "Fausto-Korpsvart",
+   "license": "GPL-3.0",
+   "source": "https://github.com/Fausto-Korpsvart/Tokyonight-GTK-Theme",
+   "from": "~/.themes",
+   "dirs": [
+    "Tokyonight-Dark"
+   ]
+  },
+  {
+   "id": "nordic-gtk",
+   "kind": "gtk",
+   "title": "Nordic",
+   "author": "EliverLara",
+   "license": "GPL-3.0",
+   "source": "https://github.com/EliverLara/Nordic",
+   "from": "~/.themes",
+   "dirs": [
+    "Nordic"
+   ],
+   "exclude": [
+    "Nordic/kde",
+    "Nordic/Art",
+    "Nordic/src",
+    "Nordic/extras",
+    "Nordic/Gulpfile.js",
+    "Nordic/package.json",
+    "Nordic/package-lock.json",
+    "Nordic/FUNDING.yml"
+   ]
+  },
+  {
+   "id": "dracula-gtk",
+   "kind": "gtk",
+   "title": "Dracula",
+   "author": "Dracula Theme",
+   "license": "GPL-3.0",
+   "source": "https://github.com/dracula/gtk",
+   "from": "~/.themes",
+   "dirs": [
+    "Dracula"
+   ]
+  },
+  {
+   "id": "gruvbox-gtk",
+   "kind": "gtk",
+   "title": "Gruvbox",
+   "author": "Fausto-Korpsvart",
+   "license": "GPL-3.0",
+   "source": "https://github.com/Fausto-Korpsvart/Gruvbox-GTK-Theme",
+   "from": "~/.themes",
+   "dirs": [
+    "Gruvbox-Dark"
+   ]
+  },
+  {
+   "id": "everforest-gtk",
+   "kind": "gtk",
+   "title": "Everforest",
+   "author": "Fausto-Korpsvart",
+   "license": "GPL-3.0",
+   "source": "https://github.com/Fausto-Korpsvart/Everforest-GTK-Theme",
+   "from": "~/.themes",
+   "dirs": [
+    "Everforest-Dark"
+   ]
+  },
+  {
+   "id": "rosepine-gtk",
+   "kind": "gtk",
+   "title": "Rosé Pine",
+   "author": "Fausto-Korpsvart",
+   "license": "GPL-3.0",
+   "source": "https://github.com/Fausto-Korpsvart/Rose-Pine-GTK-Theme",
+   "from": "~/.themes",
+   "dirs": [
+    "Rosepine-Dark"
+   ]
+  },
+  {
+   "id": "kanagawa-gtk",
+   "kind": "gtk",
+   "title": "Kanagawa",
+   "author": "Fausto-Korpsvart",
+   "license": "GPL-3.0",
+   "source": "https://github.com/Fausto-Korpsvart/Kanagawa-GKT-Theme",
+   "from": "~/.themes",
+   "dirs": [
+    "Kanagawa-Dark"
+   ]
+  },
+  {
+   "id": "colloid-gtk",
+   "kind": "gtk",
+   "title": "Colloid",
+   "author": "vinceliuice",
+   "license": "GPL-3.0",
+   "source": "https://github.com/vinceliuice/Colloid-gtk-theme",
+   "from": "~/.themes",
+   "dirs": [
+    "Colloid-Purple-Dark",
+    "Colloid-Dark",
+    "Colloid-Teal-Dark"
+   ]
+  },
+  {
+   "id": "fluent-gtk",
+   "kind": "gtk",
+   "title": "Fluent",
+   "author": "vinceliuice",
+   "license": "GPL-3.0",
+   "source": "https://github.com/vinceliuice/Fluent-gtk-theme",
+   "from": "~/.themes",
+   "dirs": [
+    "Fluent-Dark",
+    "Fluent-Dark-compact"
+   ]
+  },
+  {
+   "id": "orchis-gtk",
+   "kind": "gtk",
+   "title": "Orchis",
+   "author": "vinceliuice",
+   "license": "GPL-3.0",
+   "source": "https://github.com/vinceliuice/Orchis-theme",
+   "from": "~/.themes",
+   "dirs": [
+    "Orchis-Dark",
+    "Orchis-Dark-Compact"
+   ]
+  },
+  {
+   "id": "graphite-gtk",
+   "kind": "gtk",
+   "title": "Graphite",
+   "author": "vinceliuice",
+   "license": "GPL-3.0",
+   "source": "https://github.com/vinceliuice/Graphite-gtk-theme",
+   "from": "~/.themes",
+   "dirs": [
+    "Graphite-Dark"
+   ]
+  },
+  {
+   "id": "qogir-gtk",
+   "kind": "gtk",
+   "title": "Qogir",
+   "author": "vinceliuice",
+   "license": "GPL-3.0",
+   "source": "https://github.com/vinceliuice/Qogir-theme",
+   "from": "~/.themes",
+   "dirs": [
+    "Qogir-Dark"
+   ]
+  },
+  {
+   "id": "whitesur-gtk",
+   "kind": "gtk",
+   "title": "WhiteSur (estilo macOS)",
+   "author": "vinceliuice",
+   "license": "MIT",
+   "source": "https://github.com/vinceliuice/WhiteSur-gtk-theme",
+   "from": "~/.themes",
+   "dirs": [
+    "WhiteSur-Dark",
+    "WhiteSur-Dark-nord",
+    "WhiteSur-Light"
+   ]
+  },
+  {
+   "id": "papirus-icons",
+   "kind": "icons",
+   "title": "Papirus",
+   "author": "Papirus Development Team",
+   "license": "GPL-3.0",
+   "source": "https://github.com/PapirusDevelopmentTeam/papirus-icon-theme",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Papirus-Dark",
+    "Papirus"
+   ]
+  },
+  {
+   "id": "catppuccin-icons",
+   "kind": "icons",
+   "title": "Catppuccin Mocha",
+   "author": "Fausto-Korpsvart",
+   "license": "GPL-3.0",
+   "source": "https://github.com/Fausto-Korpsvart/Catppuccin-GTK-Theme",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Catppuccin-Mocha"
+   ],
+   "needs": [
+    "papirus-icons"
+   ]
+  },
+  {
+   "id": "tokyonight-icons",
+   "kind": "icons",
+   "title": "Tokyo Night",
+   "author": "Fausto-Korpsvart",
+   "license": "GPL-3.0",
+   "source": "https://github.com/Fausto-Korpsvart/Tokyonight-GTK-Theme",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Tokyonight-Dark"
+   ],
+   "needs": [
+    "papirus-icons"
+   ]
+  },
+  {
+   "id": "gruvbox-icons",
+   "kind": "icons",
+   "title": "Gruvbox",
+   "author": "Fausto-Korpsvart",
+   "license": "GPL-3.0",
+   "source": "https://github.com/Fausto-Korpsvart/Gruvbox-GTK-Theme",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Gruvbox-Dark"
+   ],
+   "needs": [
+    "papirus-icons"
+   ]
+  },
+  {
+   "id": "everforest-icons",
+   "kind": "icons",
+   "title": "Everforest",
+   "author": "Fausto-Korpsvart",
+   "license": "GPL-3.0",
+   "source": "https://github.com/Fausto-Korpsvart/Everforest-GTK-Theme",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Everforest-Dark"
+   ],
+   "needs": [
+    "papirus-icons"
+   ]
+  },
+  {
+   "id": "kanagawa-icons",
+   "kind": "icons",
+   "title": "Kanagawa",
+   "author": "Fausto-Korpsvart",
+   "license": "GPL-3.0",
+   "source": "https://github.com/Fausto-Korpsvart/Kanagawa-GKT-Theme",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Kanagawa"
+   ],
+   "needs": [
+    "papirus-icons"
+   ]
+  },
+  {
+   "id": "colloid-icons",
+   "kind": "icons",
+   "title": "Colloid",
+   "author": "vinceliuice",
+   "license": "GPL-3.0",
+   "source": "https://github.com/vinceliuice/Colloid-icon-theme",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Colloid-Dark",
+    "Colloid",
+    "Colloid-Light"
+   ]
+  },
+  {
+   "id": "fluent-icons",
+   "kind": "icons",
+   "title": "Fluent",
+   "author": "vinceliuice",
+   "license": "GPL-3.0",
+   "source": "https://github.com/vinceliuice/Fluent-icon-theme",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Fluent-dark",
+    "Fluent",
+    "Fluent-light",
+    ".Fluent-base",
+    ".Fluent-dark-base",
+    ".Fluent-light-base"
+   ]
+  },
+  {
+   "id": "qogir-icons",
+   "kind": "icons",
+   "title": "Qogir",
+   "author": "vinceliuice",
+   "license": "GPL-3.0",
+   "source": "https://github.com/vinceliuice/Qogir-icon-theme",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Qogir-Dark",
+    "Qogir",
+    "Qogir-Light",
+    "Qogir-Manjaro-Dark",
+    "Qogir-Manjaro",
+    "Qogir-Manjaro-Light",
+    "Qogir-Ubuntu-Dark",
+    "Qogir-Ubuntu",
+    "Qogir-Ubuntu-Light"
+   ]
+  },
+  {
+   "id": "whitesur-icons",
+   "kind": "icons",
+   "title": "WhiteSur (estilo macOS)",
+   "author": "vinceliuice",
+   "license": "GPL-3.0",
+   "source": "https://github.com/vinceliuice/WhiteSur-icon-theme",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "WhiteSur-dark",
+    "WhiteSur",
+    "WhiteSur-light"
+   ]
+  },
+  {
+   "id": "nordzy-icons",
+   "kind": "icons",
+   "title": "Nordzy",
+   "author": "alvatip",
+   "license": "GPL-3.0",
+   "source": "https://github.com/alvatip/Nordzy-icon",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Nordzy-dark",
+    "Nordzy"
+   ]
+  },
+  {
+   "id": "dracula-icons",
+   "kind": "icons",
+   "title": "Dracula",
+   "author": "m4thewz",
+   "license": "GPL-3.0",
+   "source": "https://github.com/m4thewz/dracula-icons",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Dracula"
+   ]
+  },
+  {
+   "id": "bibata-cursors",
+   "kind": "cursors",
+   "title": "Bibata",
+   "author": "ful1e5",
+   "license": "GPL-3.0",
+   "source": "https://github.com/ful1e5/Bibata_Cursor",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Bibata-Modern-Classic",
+    "Bibata-Modern-Ice",
+    "Bibata-Modern-Amber",
+    "Bibata-Original-Classic",
+    "Bibata-Original-Ice",
+    "Bibata-Original-Amber",
+    "Bibata-Modern-Classic-Right",
+    "Bibata-Modern-Ice-Right",
+    "Bibata-Modern-Amber-Right",
+    "Bibata-Original-Classic-Right",
+    "Bibata-Original-Ice-Right",
+    "Bibata-Original-Amber-Right"
+   ]
+  },
+  {
+   "id": "catppuccin-cursors",
+   "kind": "cursors",
+   "title": "Catppuccin",
+   "author": "Catppuccin",
+   "license": "GPL-2.0",
+   "source": "https://github.com/catppuccin/cursors",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "catppuccin-mocha-mauve-cursors",
+    "catppuccin-mocha-pink-cursors",
+    "catppuccin-mocha-blue-cursors",
+    "catppuccin-mocha-lavender-cursors",
+    "catppuccin-mocha-green-cursors",
+    "catppuccin-mocha-peach-cursors",
+    "catppuccin-mocha-dark-cursors"
+   ]
+  },
+  {
+   "id": "colloid-cursors",
+   "kind": "cursors",
+   "title": "Colloid",
+   "author": "vinceliuice",
+   "license": "GPL-3.0",
+   "source": "https://github.com/vinceliuice/Colloid-icon-theme",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "Colloid-dark-cursors",
+    "Colloid-cursors"
+   ]
+  },
+  {
+   "id": "whitesur-cursors",
+   "kind": "cursors",
+   "title": "WhiteSur (estilo macOS)",
+   "author": "vinceliuice",
+   "license": "GPL-3.0",
+   "source": "https://github.com/vinceliuice/WhiteSur-cursors",
+   "from": "~/.local/share/icons",
+   "dirs": [
+    "WhiteSur-cursors"
+   ]
+  }
+ ]
+}

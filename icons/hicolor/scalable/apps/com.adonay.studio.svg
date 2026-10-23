@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 1000 1000">
+  <!-- Identidade "adon": A sem a barra do meio; aqui, uma gota de tinta no lugar do play -->
+  <rect width="1000" height="1000" rx="220" fill="#cba6f7"/>
+  <g transform="translate(170 180) scale(0.66)" fill="#11111b" stroke="#11111b" stroke-width="28" stroke-linejoin="round">
+    <polygon points="110,880 440,120 560,120 890,880 700,880 500,330 300,880"/>
+    <path d="M500 610 C540 670 585 720 585 775 A85 85 0 0 1 415 775 C415 720 460 670 500 610 Z"/>
+  </g>
+</svg>

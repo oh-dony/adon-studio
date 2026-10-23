@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.adonay.studio</id>
+  <name>Adon Studio</name>
+  <summary>Deixe seu Linux com a sua cara em poucos cliques</summary>
+  <developer id="com.adonay">
+    <name>Adonay</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>Troque o tema, os ícones, o cursor, o wallpaper e a barra de tarefas do seu computador vendo uma prévia de cada opção, sem precisar abrir o terminal.</p>
+    <ul>
+      <li>Combos prontos que combinam tema, ícones, cursor e wallpaper</li>
+      <li>Loja com dezenas de temas, ícones e cursores, instalados com um clique</li>
+      <li>Barra de tarefas no estilo dock, flutuante ou clássica</li>
+      <li>Botão para voltar ao visual original a qualquer momento</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">com.adonay.studio.desktop</launchable>
+  <categories>
+    <category>Settings</category>
+    <category>DesktopSettings</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.2.0" date="2026-10-23"/>
+  </releases>
+</component>

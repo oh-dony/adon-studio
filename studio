@@ -1,0 +1,30 @@
+#!/bin/bash
+# Atalhos do projeto. Uso: ./studio <comando>
+set -e
+cd "$(dirname "$0")"
+
+case "$1" in
+  test)    # testes automatizados (os de interface são pulados sem tela)
+    python3 -m unittest discover -s tests "${@:2}"
+    find . -name __pycache__ -prune -exec rm -rf {} +
+    ;;
+  run)     # abre o app direto do código
+    exec python3 adon_studio.py
+    ;;
+  bundles) # gera os pacotes da Loja em dist/bundles (ids opcionais para refazer só alguns)
+    python3 packaging/build_bundles.py "${@:2}"
+    ;;
+  deb)     # gera o .deb em dist/
+    packaging/build-deb.sh
+    ;;
+  docker)  # instala o .deb num Ubuntu limpo e roda o teste de fumaça (padrão: 22.04 e 24.04)
+    DEB=$(packaging/build-deb.sh)
+    for img in ${2:-ubuntu:22.04 ubuntu:24.04}; do
+      echo "### $img"
+      packaging/test/run-docker.sh "$img" "$DEB" dist/bundles
+    done
+    ;;
+  *)
+    sed -n 's|^  \([a-z]*\)) *# \(.*\)|  ./studio \1  — \2|p' "$0"
+    ;;
+esac
