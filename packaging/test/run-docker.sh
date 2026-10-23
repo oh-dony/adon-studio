@@ -1,6 +1,7 @@
 #!/bin/bash
 # Instala o .deb num Ubuntu limpo (Docker) e roda o teste de fumaça sem tela (GTK Broadway).
 # Uso: packaging/test/run-docker.sh <imagem, ex. ubuntu:22.04> <arquivo .deb> <pasta com catalog.json>
+# CATALOG=<url> testa contra outro catálogo (ex. o publicado no GitHub) em vez do servidor local.
 set -e
 IMG=$1 DEB=$(realpath "$2") BUNDLES=$(realpath "$3")
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -12,7 +13,7 @@ python3 -m http.server 8765 --bind 127.0.0.1 --directory "$BUNDLES" >/dev/null 2
 SERVER=$!
 trap 'kill $SERVER' EXIT
 
-docker run --rm --network host -v "$DEB:/tmp/app.deb:ro" -v "$HERE:/test:ro" -v "$OUT:/out" "$IMG" bash -c '
+docker run --rm --network host -e CATALOG="${CATALOG:-http://127.0.0.1:8765/catalog.json}" -v "$DEB:/tmp/app.deb:ro" -v "$HERE:/test:ro" -v "$OUT:/out" "$IMG" bash -c '
   set -e
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq >/dev/null
@@ -24,7 +25,7 @@ docker run --rm --network host -v "$DEB:/tmp/app.deb:ro" -v "$HERE:/test:ro" -v 
   apt-get install -y -qq xvfb xauth imagemagick >/dev/null 2>&1
   useradd -m tester
   su tester -c "mkdir -p /tmp/shots && cd /tmp && GDK_BACKEND=x11 GSK_RENDERER=cairo GSETTINGS_BACKEND=memory \
-    ADON_STUDIO_CATALOG=http://127.0.0.1:8765/catalog.json \
+    ADON_STUDIO_CATALOG=$CATALOG \
     timeout 240 xvfb-run -a -s \"-screen 0 1280x860x24\" python3 /test/teste_app.py /usr/share/adon-studio /tmp/shots" \
     > /tmp/app.log 2>&1 || true
   grep -vE "Gtk-WARNING|^\s*$" /tmp/app.log | tail -40

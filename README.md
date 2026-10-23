@@ -39,7 +39,7 @@ Rosé Pine, Kanagawa e Tokyo Night.
 ./studio deb      # gera o .deb
 ```
 
-Regras do projeto (todo bug vira teste): [AGENTS.md](AGENTS.md).
+Regras do projeto (todo bug vira teste): [AGENTS.md](AGENTS.md). Pendências antes de divulgar: [docs/PUBLICACAO.md](docs/PUBLICACAO.md).
 
 ## Licença
 
