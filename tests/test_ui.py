@@ -25,6 +25,29 @@ class CartoesDaGrade(unittest.TestCase):
         self.assertLessEqual(nat_longo, max(nat_curto, 320))
 
 
+@unittest.skipUnless(TEM_TELA, "precisa de tela (rode numa sessão gráfica ou com GDK_BACKEND=broadway)")
+class CarregandoAoAplicar(unittest.TestCase):
+    """
+    Pedido do usuário: ao clicar num tema, ícone, cursor etc., o cartão mostra que está
+    carregando e depois confirma. Enquanto aplica, outro clique não pode disparar de novo.
+    """
+
+    def test_mostra_carregando_e_bloqueia_clique_duplo(self):
+        picks = []
+        grid = A.Grid(picks.append)
+        card = grid.add("a", Gtk.Box(), "Tema A")
+        grid.add("b", Gtk.Box(), "Tema B")
+        grid.start("a")
+        self.assertTrue(card.veil.get_visible())
+        self.assertEqual(card.veil_stack.get_visible_child_name(), "load")
+        grid.cards["b"].emit("clicked")
+        self.assertEqual(picks, [], "clique durante o carregando não pode aplicar outra coisa")
+        grid.finish("a")
+        self.assertEqual(card.veil_stack.get_visible_child_name(), "ok")
+        grid.cards["b"].emit("clicked")
+        self.assertEqual(picks, ["b"])
+
+
 class MiniaturasDaLoja(unittest.TestCase):
     """
     Regressão: na Loja (Ubuntu 24.04) as miniaturas apareciam cortadas e só cabiam 2 cartões

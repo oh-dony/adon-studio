@@ -736,6 +736,9 @@ CSS = """
                background: alpha(@accent_bg_color, 0.2); color: @accent_color; }
 .studio-pill.ok { background: alpha(@success_color, 0.2); color: @success_color; }
 .studio-notice { padding: 10px 16px; margin: 12px 18px 0 18px; }
+.studio-veil { background: alpha(@window_bg_color, 0.6); border-radius: 12px; }
+.studio-done { color: @success_color; background: alpha(@success_color, 0.18); border-radius: 99px;
+               padding: 10px; }
 """
 
 # Atalhos que funcionam também na libadwaita 1.1 / GTK 4.6 (Ubuntu 22.04, Zorin 17, Pop!_OS 22.04)
@@ -764,6 +767,47 @@ def picture(**kw):
     else:
         pic.set_keep_aspect_ratio(False)
     return pic
+
+
+class Spinner(Gtk.DrawingArea):
+    """Arco girando na cor de destaque. O Gtk.Spinner usa o ícone do tema de ícones ativo e muda
+    de cara (ou some) a cada tema; este fica igual em qualquer um."""
+
+    def __init__(self, size=40):
+        super().__init__(content_width=size, content_height=size)
+        self._angle, self._tick = 0.0, None
+        self.set_draw_func(self._draw)
+
+    def start(self):
+        if self._tick is None:
+            self._tick = self.add_tick_callback(self._step)
+
+    def stop(self):
+        if self._tick is not None:
+            self.remove_tick_callback(self._tick)
+            self._tick = None
+
+    def _step(self, _w, clock):
+        self._angle = (clock.get_frame_time() / 1e6 * 2 * pi * 1.2) % (2 * pi)
+        self.queue_draw()
+        return True
+
+    def _draw(self, _a, cr, w, h):
+        ok, acc = False, None
+        try:
+            ok, acc = self.get_style_context().lookup_color("accent_bg_color")
+        except (AttributeError, TypeError):
+            pass
+        acc = acc if ok else rgba("#cba6f7")
+        r, lw = min(w, h) / 2 - 3, 4
+        _src(cr, acc, .22)
+        cr.set_line_width(lw)
+        cr.arc(w / 2, h / 2, r, 0, 2 * pi)
+        cr.stroke()
+        _src(cr, acc)
+        cr.set_line_cap(1)  # redondo
+        cr.arc(w / 2, h / 2, r, self._angle, self._angle + pi * 1.4)
+        cr.stroke()
 
 
 def thumb_texture(path, width, height):
@@ -796,7 +840,7 @@ class Grid(Gtk.Box):
 
     def __init__(self, on_pick, extra=None, search=True):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
-        self.on_pick, self.cards, self.query, self.kind = on_pick, {}, "", None
+        self.on_pick, self.cards, self.query, self.kind, self.working = on_pick, {}, "", None, None
         bar = Gtk.Box(spacing=8, margin_start=18, margin_end=18, margin_top=12)
         if search:
             entry = Gtk.SearchEntry(placeholder_text="Buscar…", hexpand=True)
@@ -833,12 +877,45 @@ class Grid(Gtk.Box):
             box.append(Gtk.Label(label=subtitle, xalign=0, ellipsize=3, max_width_chars=24, css_classes=["sub"]))
         if extra:
             box.append(extra)
-        btn = Gtk.Button(child=box, css_classes=["card", "studio-card"], tooltip_text=title)
+        # véu do "carregando": círculo girando enquanto aplica, ✓ quando termina
+        stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, halign=Gtk.Align.CENTER,
+                          valign=Gtk.Align.CENTER, hexpand=True, vexpand=True)
+        stack.add_named(Spinner(40), "load")
+        stack.add_named(Gtk.Image(icon_name="object-select-symbolic", pixel_size=26,
+                                  css_classes=["studio-done"]), "ok")
+        veil = Gtk.Box(css_classes=["studio-veil"], visible=False)
+        veil.append(stack)
+        overlay = Gtk.Overlay(child=box)
+        overlay.add_overlay(veil)
+        btn = Gtk.Button(child=overlay, css_classes=["card", "studio-card"], tooltip_text=title)
         btn.search_text, btn.kind = f"{title} {subtitle or ''}".lower(), kind
-        btn.connect("clicked", lambda _b: self.on_pick(key))
+        btn.veil, btn.veil_stack = veil, stack
+        btn.connect("clicked", lambda _b: self.working is None and self.on_pick(key))
         self.flow.append(btn)
         self.cards[key] = btn
         return btn
+
+    def start(self, key):
+        """Cartão em 'carregando'; cliques na grade ficam bloqueados até finish()."""
+        self.working = key
+        btn = self.cards.get(key)
+        if btn:
+            btn.veil_stack.set_visible_child_name("load")
+            btn.veil_stack.get_child_by_name("load").start()
+            btn.veil.set_visible(True)
+
+    def finish(self, key, ok=True):
+        self.working = None
+        btn = self.cards.get(key)
+        if not btn:
+            return
+        btn.veil_stack.get_child_by_name("load").stop()
+        if not ok:
+            btn.veil.set_visible(False)
+            return
+        btn.veil_stack.set_visible_child_name("ok")
+        btn.veil.set_visible(True)  # o cartão pode ter sido recriado depois de um download
+        GLib.timeout_add(900, lambda: btn.veil.set_visible(False) or False)
 
     def mark(self, key):
         for k, btn in self.cards.items():
@@ -956,6 +1033,32 @@ class Window(Adw.ApplicationWindow):
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
 
+    MIN_LOAD_MS = 600  # o sistema leva um instante para redesenhar; abaixo disso a animação só pisca
+
+    def _feedback(self, page, key, apply, message):
+        """Carregando no cartão → aplica → ✓. O atraso inicial deixa o círculo aparecer antes do trabalho."""
+        grid = self.grids.get(page)
+        if grid:
+            grid.start(key)
+
+        def run():
+            try:
+                apply()
+            except Exception:
+                if grid:
+                    grid.finish(key, ok=False)
+                raise
+            GLib.timeout_add(self.MIN_LOAD_MS, done)
+            return False
+
+        def done():
+            if grid:
+                grid.finish(key)
+            self.refresh_marks()
+            self.toast(message)
+            return False
+        GLib.timeout_add(80, run)
+
     def refresh_marks(self):
         i = self.desk.iface
         current = {"temas": i.get_string("gtk-theme"), "icones": i.get_string("icon-theme"),
@@ -965,9 +1068,11 @@ class Window(Adw.ApplicationWindow):
             if name in current:
                 grid.mark(current[name])
 
-    def _download(self, items, label, then):
+    def _download(self, items, label, then, fail=None):
         if self.busy:
             self.toast("Espere o download atual terminar")
+            if fail:
+                fail()
             return
         self.busy = True
         self.prog.set_text(label)
@@ -979,6 +1084,8 @@ class Window(Adw.ApplicationWindow):
             self.prog_bar.set_reveal_child(False)
             if err:
                 self.toast(f"Não deu para baixar: {err}")
+                if fail:
+                    fail()
                 return
             self.rebuild()
             then()
@@ -1010,7 +1117,7 @@ class Window(Adw.ApplicationWindow):
                     wall=wall, need=self.store.with_needs(need))
 
     def _build_combos(self, holder):
-        grid = Grid(self._pick_combo, search=False)
+        grid = self.grids["combos"] = Grid(self._pick_combo, search=False)
         holder.append(grid)
         self.packs = {}
         for pack in PACKS:
@@ -1035,13 +1142,18 @@ class Window(Adw.ApplicationWindow):
 
     def _pick_combo(self, title):
         p = self.packs[title]
-        if p["need"]:
-            self._download(p["need"], f"Baixando o combo {title}…", lambda: self._apply_combo(title))
-        else:
-            self._apply_combo(title)
+        if not p["need"]:
+            self._feedback("combos", title, lambda: self._apply_combo(title), f"Combo {title} aplicado")
+            return
+        self.grids["combos"].start(title)
+        # depois do download a aba é refeita (rebuild), então o cartão novo recebe o carregando de novo
+        self._download(p["need"], f"Baixando o combo {title}…",
+                       lambda: self._feedback("combos", title, lambda: self._apply_combo(title),
+                                              f"Combo {title} aplicado"),
+                       fail=lambda: self.grids["combos"].finish(title, ok=False))
 
     def _apply_combo(self, title):
-        p = self.packs.get(title) or self._resolve(next(x for x in PACKS if x[0] == title))
+        p = self._resolve(next(x for x in PACKS if x[0] == title))
         if p["gtk"] in self.themes:
             self.desk.apply_gtk(self.themes[p["gtk"]])
         if p["icon"] in self.icons:
@@ -1049,8 +1161,6 @@ class Window(Adw.ApplicationWindow):
         if p["cursor"] in self.cursors:
             self.desk.apply_cursor(p["cursor"])
         self.desk.apply_wallpaper(WALLS / f"{p['wall']}.svg")
-        self.refresh_marks()
-        self.toast(f"Combo {title} aplicado")
 
     # --- temas
     def _build_themes(self, holder):
@@ -1064,9 +1174,8 @@ class Window(Adw.ApplicationWindow):
         add_batched(self.themes.values(), add, self.refresh_marks)
 
     def _pick_theme(self, name):
-        self.desk.apply_gtk(self.themes[name])
-        self.refresh_marks()
-        self.toast(f"Tema {pretty(name)} aplicado — apps abertos podem precisar ser reabertos")
+        self._feedback("temas", name, lambda: self.desk.apply_gtk(self.themes[name]),
+                       f"Tema {pretty(name)} aplicado — apps abertos podem precisar ser reabertos")
 
     # --- ícones
     def _build_icons(self, holder):
@@ -1075,9 +1184,7 @@ class Window(Adw.ApplicationWindow):
         add_batched(self.icons, lambda n: grid.add(n, icon_preview(n), pretty(n)), self.refresh_marks)
 
     def _pick_icons(self, name):
-        self.desk.apply_icons(name)
-        self.refresh_marks()
-        self.toast(f"Ícones {pretty(name)} aplicados")
+        self._feedback("icones", name, lambda: self.desk.apply_icons(name), f"Ícones {pretty(name)} aplicados")
 
     # --- cursores
     def _build_cursors(self, holder):
@@ -1087,9 +1194,8 @@ class Window(Adw.ApplicationWindow):
                     self.refresh_marks)
 
     def _pick_cursor(self, name):
-        self.desk.apply_cursor(name)
-        self.refresh_marks()
-        self.toast(f"Cursor {pretty(name)} aplicado — alguns apps só mudam ao reabrir")
+        self._feedback("cursores", name, lambda: self.desk.apply_cursor(name),
+                       f"Cursor {pretty(name)} aplicado — alguns apps só mudam ao reabrir")
 
     # --- wallpapers
     def _build_walls(self, holder):
@@ -1113,9 +1219,7 @@ class Window(Adw.ApplicationWindow):
         add_batched(list_wallpapers(), add, self.refresh_marks)
 
     def _pick_wall(self, path):
-        self.desk.apply_wallpaper(path)
-        self.refresh_marks()
-        self.toast("Wallpaper aplicado")
+        self._feedback("wallpaper", str(path), lambda: self.desk.apply_wallpaper(path), "Wallpaper aplicado")
 
     def _choose_wall(self, _btn):
         filt = Gtk.FileFilter(name="Imagens")
@@ -1190,9 +1294,11 @@ class Window(Adw.ApplicationWindow):
                     "Remover", lambda: (self.store.remove(item), self.rebuild(), self._store_refresh(),
                                         self.toast(f"{item['title']} removido")))
             return
+        self.grids["loja"].start(item_id)
         self._download(self.store.with_needs([item]), f"Baixando {item['title']}…", lambda: (
-            self._store_refresh(),
-            self.toast(f"{item['title']} instalado — escolha na aba {self.KIND_PAGE[item['kind']]}")))
+            self._store_refresh(), self.grids["loja"].finish(item_id),
+            self.toast(f"{item['title']} instalado — escolha na aba {self.KIND_PAGE[item['kind']]}")),
+            fail=lambda: self.grids["loja"].finish(item_id, ok=False))
 
     def _install_all(self, _btn):
         todo = [i for i in self.store.items.values() if not self.store.is_installed(i)]
