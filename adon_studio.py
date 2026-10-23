@@ -20,7 +20,7 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk  # noqa: 
 
 APP_ID = "com.adonay.studio"
 APP_NAME = "Adon Studio"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 HOME = Path.home()
 USER_DATA = Path(GLib.get_user_data_dir())
