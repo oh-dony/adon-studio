@@ -138,6 +138,7 @@ class Desktop:
                 shutil.copytree(p, BACKUP / name, dirs_exist_ok=True)
                 gtk4[name] = {"dir": name}
         values["gtk4"] = gtk4
+        values["blur"] = Blur().snapshot() if Blur.installed() else None
         values["cursor-default"] = CURSOR_DEFAULT.exists()
         if CURSOR_DEFAULT.exists():
             shutil.copytree(CURSOR_DEFAULT, BACKUP / "cursor-default", dirs_exist_ok=True)
@@ -167,6 +168,9 @@ class Desktop:
                 shutil.copy2(BACKUP / name, dest)
             elif "dir" in info:
                 shutil.copytree(BACKUP / name, dest)
+        blur = Blur()
+        if blur.root:
+            blur.restore(values.get("blur"))
         shutil.rmtree(CURSOR_DEFAULT, ignore_errors=True)
         if values.get("cursor-default"):
             shutil.copytree(BACKUP / "cursor-default", CURSOR_DEFAULT)
@@ -184,21 +188,8 @@ class Desktop:
 
     def ensure_user_theme(self):
         """Liga a extensão User Themes (sem ela o tema não chega ao painel). True se está ativa."""
-        if not any((d / "gnome-shell" / "extensions" / USER_THEME_UUID).is_dir() for d in [USER_DATA] + SYS_DATA):
+        if not extension_installed(USER_THEME_UUID) or not enable_extension(USER_THEME_UUID):
             return False
-        shell = settings_for("org.gnome.shell")
-        if shell and USER_THEME_UUID in shell.get_strv("enabled-extensions"):
-            return True
-        try:
-            Gio.bus_get_sync(Gio.BusType.SESSION).call_sync(
-                "org.gnome.Shell.Extensions", "/org/gnome/Shell/Extensions", "org.gnome.Shell.Extensions",
-                "EnableExtension", GLib.Variant("(s)", (USER_THEME_UUID,)), None, Gio.DBusCallFlags.NONE, -1, None)
-        except GLib.Error:
-            if not shell:
-                return False
-            shell.set_strv("enabled-extensions", shell.get_strv("enabled-extensions") + [USER_THEME_UUID])
-            shell.set_strv("disabled-extensions",
-                           [u for u in shell.get_strv("disabled-extensions") if u != USER_THEME_UUID])
         self.shell = self.shell or settings_for("org.gnome.shell.extensions.user-theme")
         return True
 
@@ -212,9 +203,15 @@ class Desktop:
         src = theme.path / "gtk-4.0"
         if src.is_dir() and not any(theme.path.is_relative_to(d) for d in SYS_DATA):
             GTK4_CFG.mkdir(parents=True, exist_ok=True)
-            for name in GTK4_FILES:
+            # @import em vez de atalho: caminhos relativos do tema (url("../assets/...")) passam a
+            # valer a partir da pasta do tema, e não de ~/.config (sem isso o Dracula some com os
+            # interruptores de todos os apps GTK4)
+            for name in ("gtk.css", "gtk-dark.css"):
                 if (src / name).exists():
-                    (GTK4_CFG / name).symlink_to(src / name)
+                    (GTK4_CFG / name).write_text(f"/* {APP_NAME}: tema {theme.name} */\n"
+                                                 f'@import url("{(src / name).as_uri()}");\n')
+            if (src / "assets").is_dir():
+                (GTK4_CFG / "assets").symlink_to(src / "assets")
 
     def apply_icons(self, name):
         self.iface.set_string("icon-theme", name)
@@ -459,6 +456,176 @@ class Store:
             link = HOME / ".icons" / d
             if link.is_symlink():
                 link.unlink()
+
+
+# ---------------------------------------------------------------- efeitos (vidro)
+
+BLUR_UUID = "blur-my-shell@aunetx"
+BLUR_SCHEMA = "org.gnome.shell.extensions.blur-my-shell"
+ADON_PIPELINE = "pipeline_adon_studio"
+NAUTILUS = ["org.gnome.Nautilus", "nautilus"]
+GLASS_OPACITY = 170  # de 255; o padrão da extensão (215) quase não deixa ver o vidro
+BLUR_PARTS = [  # componente da Blur my Shell, título, explicação
+    ("popup", "Menus e janelinhas", "Menu de aplicativos, menus do sistema e avisos"),
+    ("overview", "Visão geral", "Tela com as janelas e os aplicativos (Super+A)"),
+    ("appfolder", "Pastas de aplicativos", None),
+    ("lockscreen", "Tela de bloqueio", None),
+    ("panel", "Barra superior", "A barra no topo da tela do GNOME"),
+]
+WINDOW_MODES = [("nenhuma", "Desligado"), ("arquivos", "Só no gerenciador de arquivos"),
+                ("todas", "Todas as janelas (experimental)")]
+BLUR_PRESETS = {
+    "Sem vidro": dict(parts=[], radius=30, brightness=.6, windows="nenhuma"),
+    "Vidro suave": dict(parts=["popup", "overview", "appfolder", "lockscreen", "panel"], radius=20,
+                        brightness=.85, windows="nenhuma"),
+    "Vidro forte": dict(parts=["popup", "overview", "appfolder", "lockscreen", "panel"], radius=50,
+                        brightness=.6, windows="arquivos"),
+    "Vidro total": dict(parts=["popup", "overview", "appfolder", "lockscreen", "panel"], radius=40,
+                        brightness=.7, windows="todas"),
+}
+
+
+def enable_extension(uuid):
+    """Liga uma extensão do GNOME Shell já instalada. True se ficou ligada."""
+    shell = settings_for("org.gnome.shell")
+    if shell and uuid in shell.get_strv("enabled-extensions"):
+        return True
+    try:
+        Gio.bus_get_sync(Gio.BusType.SESSION).call_sync(
+            "org.gnome.Shell.Extensions", "/org/gnome/Shell/Extensions", "org.gnome.Shell.Extensions",
+            "EnableExtension", GLib.Variant("(s)", (uuid,)), None, Gio.DBusCallFlags.NONE, -1, None)
+    except GLib.Error:
+        if not shell:
+            return False
+        shell.set_strv("enabled-extensions", shell.get_strv("enabled-extensions") + [uuid])
+        shell.set_strv("disabled-extensions", [u for u in shell.get_strv("disabled-extensions") if u != uuid])
+    return True
+
+
+def extension_installed(uuid):
+    return any((d / "gnome-shell" / "extensions" / uuid).is_dir() for d in [USER_DATA] + SYS_DATA)
+
+
+class Blur:
+    """Controle do vidro via extensão Blur my Shell. A versão nova (GNOME 45+) guarda a intensidade
+    num 'pipeline'; a antiga (GNOME 42, Zorin 17) em sigma/brightness."""
+
+    def __init__(self, schema=BLUR_SCHEMA):
+        self.root = settings_for(schema)
+        names = [p for p, _t, _s in BLUR_PARTS] + ["applications"]
+        self.parts = {p: s for p in names if (s := settings_for(f"{schema}.{p}"))} if self.root else {}
+
+    @staticmethod
+    def installed():
+        return extension_installed(BLUR_UUID)
+
+    @staticmethod
+    def install(done):
+        """Pede ao GNOME para instalar a extensão (ele mostra a confirmação). done('ok' ou erro)."""
+        def finished(bus, res):
+            try:
+                answer = bus.call_finish(res).unpack()[0]
+                done("ok" if answer == "successful" else answer)
+            except GLib.Error as e:
+                # o Shell às vezes encerra a chamada sem responder mesmo tendo instalado
+                err = e.message
+                GLib.timeout_add(1500, lambda: done("ok" if Blur.installed() else err) or False)
+        Gio.bus_get_sync(Gio.BusType.SESSION).call(
+            "org.gnome.Shell.Extensions", "/org/gnome/Shell/Extensions", "org.gnome.Shell.Extensions",
+            "InstallRemoteExtension", GLib.Variant("(s)", (BLUR_UUID,)), GLib.VariantType("(s)"),
+            Gio.DBusCallFlags.NONE, -1, None, finished)
+
+    @property
+    def modern(self):
+        return has_key(self.root, "pipelines")
+
+    def get(self, part):
+        s = self.parts.get(part)
+        return bool(s) and s.get_boolean("blur")
+
+    def set(self, part, on):
+        if part in self.parts:
+            self.parts[part].set_boolean("blur", on)
+
+    def adapt(self, zorin):
+        """No Zorin a barra superior do GNOME fica escondida: vidro nela vira um bloco solto na tela."""
+        if zorin:
+            self.set("panel", False)
+
+    def windows(self):
+        s = self.parts.get("applications")
+        if not s or not s.get_boolean("blur"):
+            return "nenhuma"
+        return "todas" if s.get_boolean("enable-all") else "arquivos"
+
+    def set_windows(self, mode):
+        s = self.parts.get("applications")
+        if not s:
+            return
+        if mode != "nenhuma" and self.windows() == "nenhuma" and has_key(s, "opacity"):
+            s.set_int("opacity", min(s.get_int("opacity"), GLASS_OPACITY))
+        others = [a for a in s.get_strv("whitelist") if a not in NAUTILUS]
+        s.set_strv("whitelist", others + (NAUTILUS if mode == "arquivos" else []))
+        s.set_boolean("enable-all", mode == "todas")
+        # a extensão deixa opaca a janela em foco; aí a janela que você está usando nunca fica de vidro
+        if has_key(s, "dynamic-opacity") and mode != "nenhuma":
+            s.set_boolean("dynamic-opacity", False)
+        s.set_boolean("blur", mode != "nenhuma")
+
+    def strength(self):
+        """(raio do desfoque, brilho)"""
+        if not self.modern:
+            return self.root.get_int("sigma"), round(self.root.get_double("brightness"), 2)
+        pipes = self.root.get_value("pipelines").unpack()
+        for name in (ADON_PIPELINE, "pipeline_default"):
+            for effect in pipes.get(name, {}).get("effects", []):
+                params = effect.get("params", {})
+                if "unscaled_radius" in params:
+                    return params["unscaled_radius"], round(params.get("brightness", .6), 2)
+        return 30, .6
+
+    def set_strength(self, radius, brightness):
+        radius, brightness = int(radius), round(float(brightness), 2)
+        if not self.modern:
+            self.root.set_int("sigma", radius)
+            self.root.set_double("brightness", brightness)
+            for s in self.parts.values():
+                if has_key(s, "customize"):
+                    s.set_boolean("customize", False)
+            return
+        # mantém os pipelines que já existem e grava/atualiza só o nosso
+        old, entries = self.root.get_value("pipelines"), []
+        for i in range(old.n_children()):
+            kv = old.get_child_value(i)
+            name = kv.get_child_value(0).get_string()
+            if name != ADON_PIPELINE:
+                entries.append(f"{GLib.Variant('s', name).print_(False)}: {kv.get_child_value(1).print_(True)}")
+        entries.append(f"'{ADON_PIPELINE}': {{'name': <'Adon Studio'>, 'effects': <[<{{'type': <'dual_kawase_blur'>, "
+                       f"'id': <'effect_adonstudio0'>, 'params': <{{'unscaled_radius': <{radius}>, "
+                       f"'brightness': <{brightness:.2f}>}}>}}>]>}}")
+        self.root.set_value("pipelines", GLib.Variant.parse(GLib.VariantType("a{sa{sv}}"),
+                                                            "{" + ", ".join(entries) + "}", None, None))
+        for s in self.parts.values():
+            if has_key(s, "pipeline"):
+                s.set_string("pipeline", ADON_PIPELINE)
+
+    def apply_preset(self, p, zorin):
+        for part, _t, _s in BLUR_PARTS:
+            self.set(part, part in p["parts"])
+        self.set_windows(p["windows"])
+        self.set_strength(p["radius"], p["brightness"])
+        self.adapt(zorin)
+
+    def snapshot(self):
+        return {p: self.get(p) for p in self.parts} | {"_windows": self.windows()}
+
+    def restore(self, saved):
+        """Volta ao que estava no backup; sem backup do vidro, desliga tudo."""
+        saved = saved or {}
+        for p in self.parts:
+            if p != "applications":
+                self.set(p, saved.get(p, False))
+        self.set_windows(saved.get("_windows", "nenhuma"))
 
 
 # ---------------------------------------------------------------- cores e desenho
@@ -838,7 +1005,7 @@ def mb(n):
 class Grid(Gtk.Box):
     """Grade de cartões clicáveis com busca."""
 
-    def __init__(self, on_pick, extra=None, search=True):
+    def __init__(self, on_pick, extra=None, search=True, scroll=True):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.on_pick, self.cards, self.query, self.kind, self.working = on_pick, {}, "", None, None
         bar = Gtk.Box(spacing=8, margin_start=18, margin_end=18, margin_top=12)
@@ -854,7 +1021,12 @@ class Grid(Gtk.Box):
                                 max_children_per_line=6, min_children_per_line=1, row_spacing=14,
                                 column_spacing=14, margin_start=18, margin_end=18, margin_top=12, margin_bottom=18)
         self.flow.set_filter_func(self._visible)
-        self.append(Gtk.ScrolledWindow(child=self.flow, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
+        if scroll:
+            self.append(Gtk.ScrolledWindow(child=self.flow, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
+        else:  # dentro de uma página que já rola (Adw.PreferencesPage)
+            self.flow.set_margin_start(0)
+            self.flow.set_margin_end(0)
+            self.append(self.flow)
 
     def _visible(self, child):
         btn = child.get_child()
@@ -950,6 +1122,7 @@ class Window(Adw.ApplicationWindow):
         ("cursores", "Cursores", "input-mouse-symbolic", "_build_cursors"),
         ("wallpaper", "Wallpaper", "preferences-desktop-wallpaper-symbolic", "_build_walls"),
         ("barra", "Barra", "view-continuous-symbolic", "_build_bar"),
+        ("efeitos", "Efeitos", "weather-fog-symbolic", "_build_effects"),
         ("loja", "Loja", "system-software-install-symbolic", "_build_store"),
     ]
     KIND_PAGE = {"gtk": "Temas", "icons": "Ícones", "cursors": "Cursores"}
@@ -1424,6 +1597,144 @@ class Window(Adw.ApplicationWindow):
         self.bar_hide.set_active(has_key(b, "intellihide") and b.get_boolean("intellihide"))
         self._syncing = False
 
+    # --- efeitos (vidro)
+    def _is_zorin(self):
+        return self.desk.bar is not None and "zorin" in self.desk.bar.props.schema_id
+
+    def _build_effects(self, holder):
+        blur = self.blur = Blur()
+        if not Blur.installed() or not blur.root:
+            status = Adw.StatusPage(
+                icon_name="weather-fog-symbolic", vexpand=True, title="Efeito de vidro",
+                description="Deixa menus, telas e janelas com aparência de vidro fosco. Usa a extensão gratuita "
+                            "Blur my Shell: o sistema vai perguntar se você quer instalar, é só confirmar.")
+            btn = Gtk.Button(label="Instalar efeito de vidro", css_classes=["suggested-action", "pill"],
+                             halign=Gtk.Align.CENTER)
+            btn.connect("clicked", self._install_blur)
+            status.set_child(btn)
+            holder.append(status)
+            return
+        enable_extension(BLUR_UUID)
+        zorin = self._is_zorin()
+        blur.adapt(zorin)
+        page = Adw.PreferencesPage()
+        holder.append(page)
+
+        presets = Adw.PreferencesGroup(title="Estilos prontos")
+        grid = self.grids["efeitos"] = Grid(self._pick_effect, search=False, scroll=False)
+        for name, p in BLUR_PRESETS.items():
+            grid.add(name, drawing(220, 120, lambda cr, w, h, p=p: self._draw_glass(cr, w, h, p)), name)
+        presets.add(grid)
+        page.add(presets)
+
+        self._fx_syncing = False
+        where = Adw.PreferencesGroup(title="Onde aplicar")
+        self.fx_switch = {}
+        for part, title, sub in BLUR_PARTS:
+            if part not in blur.parts:
+                continue
+            if part == "panel" and zorin:
+                sub = "No Zorin a barra de tarefas é outra; o vidro nela chega numa próxima versão"
+            row, sw = switch_row(title, sub)
+            row.set_sensitive(not (part == "panel" and zorin))
+            sw.connect("notify::active", lambda s, _p, part=part: self._fx_change(lambda: blur.set(part, s.get_active())))
+            self.fx_switch[part] = sw
+            where.add(row)
+        self.fx_windows = Adw.ComboRow(title="Vidro nas janelas",
+                                       subtitle="O modo de todas as janelas pesa na placa de vídeo",
+                                       model=Gtk.StringList.new([label for _m, label in WINDOW_MODES]))
+        self.fx_windows.connect("notify::selected", lambda r, _p: self._fx_change(
+            lambda: (blur.set_windows(WINDOW_MODES[r.get_selected()][0]), self._fx_sync())))
+        where.add(self.fx_windows)
+        page.add(where)
+
+        strength = Adw.PreferencesGroup(title="Intensidade")
+        self.fx_radius = self._fx_scale(strength, "Desfoque", 0, 100)
+        self.fx_bright = self._fx_scale(strength, "Brilho", 30, 100)
+        self.fx_opacity = self._fx_scale(strength, "Opacidade das janelas", 50, 100)
+        page.add(strength)
+        for sc in (self.fx_radius, self.fx_bright):
+            sc.connect("value-changed", lambda _s: self._fx_change(self._fx_save_strength))
+        self.fx_opacity.connect("value-changed", lambda s: self._fx_change(
+            lambda: blur.parts["applications"].set_int("opacity", int(s.get_value() * 2.55))))
+        self._fx_sync()
+
+    def _fx_scale(self, group, title, lo, hi):
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, 1)
+        scale.set_size_request(260, -1)
+        scale.set_valign(Gtk.Align.CENTER)
+        row = Adw.ActionRow(title=title)
+        row.add_suffix(scale)
+        group.add(row)
+        scale.row = row
+        return scale
+
+    def _fx_change(self, fn):
+        if not self._fx_syncing:
+            fn()
+
+    def _fx_save_strength(self):
+        # a extensão redesenha a cada gravação: espera o controle parar de mexer
+        if getattr(self, "_fx_timer", None):
+            GLib.source_remove(self._fx_timer)
+
+        def save():
+            self._fx_timer = None
+            self.blur.set_strength(self.fx_radius.get_value() * 0.6, self.fx_bright.get_value() / 100)
+            return False
+        self._fx_timer = GLib.timeout_add(250, save)
+
+    def _fx_sync(self):
+        b = self.blur
+        self._fx_syncing = True
+        for part, sw in self.fx_switch.items():
+            sw.set_active(b.get(part))
+        mode = b.windows()
+        self.fx_windows.set_selected(next(i for i, (m, _l) in enumerate(WINDOW_MODES) if m == mode))
+        radius, bright = b.strength()
+        self.fx_radius.set_value(radius / 0.6)
+        self.fx_bright.set_value(bright * 100)
+        apps = b.parts.get("applications")
+        self.fx_opacity.set_value(apps.get_int("opacity") / 2.55 if apps else 85)
+        self.fx_opacity.row.set_sensitive(mode != "nenhuma")
+        self._fx_syncing = False
+
+    def _pick_effect(self, name):
+        self._feedback("efeitos", name, lambda: (self.blur.apply_preset(BLUR_PRESETS[name], self._is_zorin()),
+                                                 self._fx_sync()), f"{name} aplicado")
+
+    def _install_blur(self, btn):
+        btn.set_sensitive(False)
+        btn.set_label("Esperando você confirmar…")
+
+        def done(result):
+            if result == "ok":
+                Blur().adapt(self._is_zorin())
+                self.rebuild("efeitos")
+                self.toast("Efeito de vidro instalado")
+            else:
+                btn.set_sensitive(True)
+                btn.set_label("Instalar efeito de vidro")
+                self.toast("Instalação cancelada" if result == "cancelled" else f"Não deu para instalar: {result}")
+        Blur.install(done)
+
+    @staticmethod
+    def _draw_glass(cr, w, h, p):
+        draw_backdrop(cr, w, h, WALL_PALETTES["neon"])
+        glass = bool(p["parts"])
+        strength = p["radius"] / 50 if glass else 0
+        x, y, gw, gh = w * .14, h * .18, w * .72, h * .64
+        _src(cr, rgba("#ffffff") if glass else rgba("#1e1e2e"), .10 + .12 * strength if glass else 1)
+        _rr(cr, x, y, gw, gh, 12)
+        cr.fill_preserve()
+        _src(cr, rgba("#ffffff"), .35 if glass else .08)
+        cr.set_line_width(1.2)
+        cr.stroke()
+        for i, frac in enumerate((.6, .4, .5)):
+            _src(cr, rgba("#ffffff"), .75 if i == 0 else .4)
+            _rr(cr, x + 14, y + 16 + i * 14, (gw - 28) * frac, 7, 3.5)
+            cr.fill()
+
     # --- restaurar / sobre
     def _ask_restore(self, _btn):
         confirm(self, "Voltar ao visual original?",
@@ -1435,6 +1746,8 @@ class Window(Adw.ApplicationWindow):
         self.refresh_marks()
         if not self.builders["barra"][1] and self.desk.bar:
             self._bar_sync()
+        if not self.builders["efeitos"][1]:
+            self.rebuild("efeitos")
         self.toast("Visual original restaurado")
 
     def _about(self, _btn):

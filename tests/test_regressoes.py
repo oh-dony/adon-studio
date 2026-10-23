@@ -111,9 +111,42 @@ class TemaGtk4(unittest.TestCase):
         (theme / "gtk-4.0" / "gtk-dark.css").write_text("/* escuro */")
         desk = A.Desktop()
         desk.apply_gtk(A.Theme("Claro-Light", theme))
-        self.assertEqual((A.GTK4_CFG / "gtk.css").read_text(), "/* claro */")
-        self.assertEqual((A.GTK4_CFG / "gtk-dark.css").read_text(), "/* escuro */")
+        self.assertIn((theme / "gtk-4.0" / "gtk.css").as_uri(), (A.GTK4_CFG / "gtk.css").read_text())
+        self.assertIn((theme / "gtk-4.0" / "gtk-dark.css").as_uri(), (A.GTK4_CFG / "gtk-dark.css").read_text())
         self.assertEqual(desk.iface.get_string("color-scheme"), "prefer-light")
+
+
+class ImagensDoTemaGtk4(unittest.TestCase):
+    """
+    Regressão: com o tema Dracula, os interruptores (liga/desliga) ficavam invisíveis em todos os
+    apps GTK4. O tema aponta as imagens como "../assets/switch-off.svg", relativo ao CSS; o app
+    ligava o CSS em ~/.config/gtk-4.0 por atalho, e o GTK resolvia o caminho a partir de
+    ~/.config, onde as imagens não existem. Com @import, o caminho vale a partir da pasta do tema.
+    """
+
+    def test_css_do_tema_e_importado_e_nao_ligado_por_atalho(self):
+        theme = A.USER_DATA / "themes" / "ComAssets"
+        mkdirs(theme / "gtk-3.0", theme / "gtk-4.0", theme / "assets")
+        (theme / "gtk-3.0" / "gtk.css").write_text("")
+        (theme / "assets" / "switch-off.svg").write_text("<svg/>")
+        (theme / "gtk-4.0" / "gtk.css").write_text('switch { background-image: url("../assets/switch-off.svg"); }')
+        A.Desktop().apply_gtk(A.Theme("ComAssets", theme))
+        cfg = A.GTK4_CFG / "gtk.css"
+        self.assertFalse(cfg.is_symlink())
+        self.assertIn(f'@import url("{(theme / "gtk-4.0" / "gtk.css").as_uri()}")', cfg.read_text())
+
+    def test_trocar_de_tema_substitui_o_import(self):
+        a, b = A.USER_DATA / "themes" / "TemaA", A.USER_DATA / "themes" / "TemaB"
+        for t in (a, b):
+            mkdirs(t / "gtk-3.0", t / "gtk-4.0")
+            (t / "gtk-3.0" / "gtk.css").write_text("")
+            (t / "gtk-4.0" / "gtk.css").write_text("")
+        desk = A.Desktop()
+        desk.apply_gtk(A.Theme("TemaA", a))
+        desk.apply_gtk(A.Theme("TemaB", b))
+        text = (A.GTK4_CFG / "gtk.css").read_text()
+        self.assertIn("TemaB", text)
+        self.assertNotIn("TemaA", text)
 
 
 class PastasOcultas(unittest.TestCase):
