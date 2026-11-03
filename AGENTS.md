@@ -39,6 +39,7 @@ no fim deste arquivo. Nunca deixe isso passar em silêncio.
 | Pacote da Loja incompleto, atalho quebrado, catálogo | `tests/test_regressoes.py` (usa `packaging/build_bundles.py`) | `./studio test` |
 | Interface: tamanho, layout, widget | `tests/test_ui.py` (pulado sem tela) | `./studio test` numa sessão gráfica |
 | Não instala ou não abre num Ubuntu limpo, dependência faltando, API de GTK/libadwaita antiga | `packaging/test/teste_app.py` no Docker | `./studio docker` |
+| Num sistema recém-instalado o combo não pega em tudo (painel, Nautilus, extensão, wallpaper) | `packaging/test/gnome/verifica.py`: GNOME Shell de verdade sem tela no Docker (Ubuntu 22.04, 24.04, Pop!_OS 22.04) | `./studio gnome` (≈5 min por sistema; a 1ª vez monta as imagens, ≈15 min) |
 
 Dicas:
 - `tests/base.py` isola tudo: HOME e pastas XDG temporárias, GSettings em memória e um
@@ -76,5 +77,7 @@ Dicas:
 - **Instalador do WhiteSur aborta em silêncio** (bug do script deles ao instalar o
   `gnome-theme-switcher`). Usamos os `.tar.xz` prontos da pasta `release/` do repositório
   deles. Não é código nosso.
+- **Dock do Pop!_OS continua cinza** depois do combo: o `cosmic-dock` tem estilo próprio, que o
+  tema do Shell não alcança. Visto nos prints do `./studio gnome`; não é bug do app.
 - **O quadrado cinza em si** só aparece no GNOME Shell de verdade. O teste cobre a causa
   (cursor fora de `~/.icons`); confirmação visual só numa sessão GNOME.

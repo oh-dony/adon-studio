@@ -248,12 +248,16 @@ class Desktop:
             elif p.is_dir():
                 shutil.rmtree(p)
 
-    def ensure_user_theme(self):
-        """Liga a extensão User Themes (sem ela o tema não chega ao painel). True se está ativa."""
-        if not extension_installed(USER_THEME_UUID) or not enable_extension(USER_THEME_UUID):
-            return False
+    def ensure_user_theme(self, bus=None):
+        """Liga a extensão User Themes (sem ela o tema não chega ao painel).
+        'ok': ligada; 'carregar': instalada, mas o Shell aberto ainda não a enxerga (instalada
+        depois do login); 'falta': não está instalada."""
+        if not extension_installed(USER_THEME_UUID):
+            return "falta"
         self.shell = self.shell or settings_for("org.gnome.shell.extensions.user-theme")
-        return True
+        if enable_extension(USER_THEME_UUID, bus):
+            return "ok"
+        return "carregar" if shell_extension_info(USER_THEME_UUID, bus) == {} else "falta"
 
     def apply_gtk(self, theme):
         self.iface.set_string("color-scheme", "prefer-light" if "light" in theme.name.lower() else "prefer-dark")
@@ -576,21 +580,61 @@ BLUR_PRESETS = {
 }
 
 
-def enable_extension(uuid):
+SHELL_EXT = ("org.gnome.Shell.Extensions", "/org/gnome/Shell/Extensions", "org.gnome.Shell.Extensions")
+
+
+def shell_extension_info(uuid, bus=None):
+    """O que o GNOME Shell aberto sabe da extensão: {} se não a conhece (ex.: instalada depois do
+    login), None se não há Shell para perguntar."""
+    bus = bus if bus is not None else session_bus()
+    if bus is None:
+        return None
+    try:
+        return bus.call_sync(*SHELL_EXT, "GetExtensionInfo", GLib.Variant("(s)", (uuid,)),
+                             GLib.VariantType("(a{sv})"), Gio.DBusCallFlags.NONE, -1, None).unpack()[0]
+    except GLib.Error:
+        return None
+
+
+def enable_extension(uuid, bus=None):
     """Liga uma extensão do GNOME Shell já instalada. True se ficou ligada."""
     shell = settings_for("org.gnome.shell")
-    if shell and uuid in shell.get_strv("enabled-extensions"):
-        return True
+    bus = bus if bus is not None else session_bus()
     try:
-        Gio.bus_get_sync(Gio.BusType.SESSION).call_sync(
-            "org.gnome.Shell.Extensions", "/org/gnome/Shell/Extensions", "org.gnome.Shell.Extensions",
-            "EnableExtension", GLib.Variant("(s)", (uuid,)), None, Gio.DBusCallFlags.NONE, -1, None)
+        if bus is None:
+            raise GLib.Error("sem D-Bus")
+        ok = bus.call_sync(*SHELL_EXT, "EnableExtension", GLib.Variant("(s)", (uuid,)),
+                           GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, -1, None).unpack()[0]
+        if ok:
+            return True
     except GLib.Error:
-        if not shell:
-            return False
-        shell.set_strv("enabled-extensions", shell.get_strv("enabled-extensions") + [uuid])
+        ok = None
+    # sem Shell para perguntar (ou ele ainda não conhece a extensão): fica gravado para o próximo login
+    if shell:
+        if uuid not in shell.get_strv("enabled-extensions"):
+            shell.set_strv("enabled-extensions", shell.get_strv("enabled-extensions") + [uuid])
         shell.set_strv("disabled-extensions", [u for u in shell.get_strv("disabled-extensions") if u != uuid])
-    return True
+    return ok is None and shell is not None
+
+
+def install_remote_extension(uuid, done, installed=None):
+    """Pede ao GNOME Shell para baixar a extensão do extensions.gnome.org, carregar e ligar na
+    hora (ele mostra a confirmação). done('ok' ou o erro)."""
+    installed = installed or (lambda: extension_installed(uuid))
+
+    def finished(bus, res):
+        try:
+            answer = bus.call_finish(res).unpack()[0]
+            done("ok" if answer == "successful" else answer)
+        except GLib.Error as e:
+            # o Shell às vezes encerra a chamada sem responder mesmo tendo instalado
+            err = e.message
+            GLib.timeout_add(1500, lambda: done("ok" if installed() else err) or False)
+    bus = session_bus()
+    if bus is None:
+        return done("sem conexão com o GNOME Shell")
+    bus.call(*SHELL_EXT, "InstallRemoteExtension", GLib.Variant("(s)", (uuid,)), GLib.VariantType("(s)"),
+             Gio.DBusCallFlags.NONE, -1, None, finished)
 
 
 def extension_installed(uuid):
@@ -613,18 +657,7 @@ class Blur:
     @staticmethod
     def install(done):
         """Pede ao GNOME para instalar a extensão (ele mostra a confirmação). done('ok' ou erro)."""
-        def finished(bus, res):
-            try:
-                answer = bus.call_finish(res).unpack()[0]
-                done("ok" if answer == "successful" else answer)
-            except GLib.Error as e:
-                # o Shell às vezes encerra a chamada sem responder mesmo tendo instalado
-                err = e.message
-                GLib.timeout_add(1500, lambda: done("ok" if Blur.installed() else err) or False)
-        Gio.bus_get_sync(Gio.BusType.SESSION).call(
-            "org.gnome.Shell.Extensions", "/org/gnome/Shell/Extensions", "org.gnome.Shell.Extensions",
-            "InstallRemoteExtension", GLib.Variant("(s)", (BLUR_UUID,)), GLib.VariantType("(s)"),
-            Gio.DBusCallFlags.NONE, -1, None, finished)
+        install_remote_extension(BLUR_UUID, done, Blur.installed)
 
     @property
     def modern(self):
@@ -1405,7 +1438,7 @@ class Window(Adw.ApplicationWindow):
         self.desk = Desktop()
         self.desk.ensure_backup()
         self.desk.link_cursor_themes()
-        self.user_theme_ok = self.desk.ensure_user_theme()
+        self.user_theme = self.desk.ensure_user_theme()
         ensure_wallpapers()
         self.store = Store()
         self.busy = False
@@ -1414,10 +1447,19 @@ class Window(Adw.ApplicationWindow):
         self.toasts = Adw.ToastOverlay()
         self.stack = Adw.ViewStack(vexpand=True)
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        if not self.user_theme_ok:
-            body.append(Gtk.Label(wrap=True, xalign=0, css_classes=["card", "studio-notice"],
-                                  label="O tema das janelas funciona, mas para mudar também o painel do sistema "
-                                        "falta a extensão “User Themes” (pacote gnome-shell-extensions)."))
+        self.notice = Gtk.Label(wrap=True, xalign=0, css_classes=["card", "studio-notice"])
+        self.notice_bar = Gtk.Revealer(child=self.notice, reveal_child=self.user_theme != "ok")
+        body.append(self.notice_bar)
+        if self.user_theme == "falta":
+            self.notice.set_label("O tema das janelas funciona, mas para mudar também o painel do sistema "
+                                  "falta a extensão “User Themes” (pacote gnome-shell-extensions).")
+        elif self.user_theme == "carregar":
+            # instalada junto com o app, depois do login: o Shell aberto não a enxerga até sair e
+            # entrar de novo. Pedir para ele instalá-la faz ele carregar na hora.
+            self.notice.set_label("Para o painel do sistema também mudar de tema, confirme a instalação "
+                                  "da extensão “User Themes” na janela que o GNOME abriu.")
+            install_remote_extension(USER_THEME_UUID, self._user_theme_loaded,
+                                     lambda: shell_extension_info(USER_THEME_UUID) not in (None, {}))
         self.prog = Gtk.ProgressBar(show_text=True, margin_start=18, margin_end=18, margin_top=10)
         self.prog_bar = Gtk.Revealer(child=self.prog)
         body.append(self.prog_bar)
@@ -1475,6 +1517,15 @@ class Window(Adw.ApplicationWindow):
             self.grids.pop(name, None)
             self.builders[name] = (holder, getattr(self, builder))
         self._ensure_built()
+
+    def _user_theme_loaded(self, result):
+        self.user_theme = self.desk.ensure_user_theme() if result == "ok" else "carregar"
+        if self.user_theme == "ok":
+            self.notice_bar.set_reveal_child(False)
+            self.toast("Pronto: o painel do sistema agora também muda de tema")
+        else:
+            self.notice.set_label("O tema das janelas já funciona. O painel do sistema muda de tema depois "
+                                  "que você sair e entrar de novo na sessão.")
 
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=3))

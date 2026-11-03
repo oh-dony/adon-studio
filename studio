@@ -24,6 +24,15 @@ case "$1" in
       packaging/test/run-docker.sh "$img" "$DEB" dist/bundles
     done
     ;;
+  gnome)   # sistema recém-instalado com GNOME de verdade: instala o .deb, clica num combo e confere tudo
+    DEB=$(packaging/build-deb.sh)
+    FAIL=0
+    for distro in ${2:-ubuntu-22.04 ubuntu-24.04 pop-22.04}; do
+      echo "### $distro"
+      packaging/test/run-gnome.sh "$distro" "$DEB" dist/bundles "${3:-Catppuccin Rosa}" || FAIL=1
+    done
+    exit $FAIL
+    ;;
   *)
     sed -n 's|^  \([a-z]*\)) *# \(.*\)|  ./studio \1  — \2|p' "$0"
     ;;

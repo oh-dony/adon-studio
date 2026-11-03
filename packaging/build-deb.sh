@@ -34,7 +34,7 @@ Version: $VERSION
 Section: gnome
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.10), python3-gi (>= 3.42), python3-gi-cairo, gir1.2-gtk-4.0, gir1.2-adw-1, gnome-shell-extensions, librsvg2-common
+Depends: python3 (>= 3.10), python3-gi (>= 3.42), python3-gi-cairo, gir1.2-gtk-4.0, gir1.2-adw-1, gnome-shell-extensions, librsvg2-common, unzip
 Recommends: gnome-shell
 Maintainer: Adonay <oh-dony@users.noreply.github.com>
 Homepage: https://github.com/oh-dony/adon-studio

@@ -178,6 +178,56 @@ class NautilusPegaOTema(unittest.TestCase):
         self.assertFalse(A.reload_files_app(None))
 
 
+class ShellFalso:
+    """D-Bus com um GNOME Shell que conhece (ou não) a extensão User Themes."""
+
+    def __init__(self, knows):
+        self.knows, self.calls = knows, []
+
+    def call_sync(self, name, path, iface, method, args, *_rest):
+        self.calls.append(method)
+        if method == "GetExtensionInfo":
+            info = {"state": A.GLib.Variant("d", 1.0)} if self.knows else {}
+            return A.GLib.Variant("(a{sv})", (info,))
+        if method == "EnableExtension":
+            return A.GLib.Variant("(b)", (self.knows,))
+        return None
+
+
+class PainelNumSistemaNovo(unittest.TestCase):
+    """
+    Regressão: num Ubuntu 24.04 recém-instalado (teste ./studio gnome), o combo mudava janelas,
+    ícones, cursor e wallpaper, mas o painel continuava com o tema padrão, e o app nem avisava.
+    O .deb traz a extensão User Themes, mas o GNOME Shell já aberto não enxerga extensão
+    instalada depois do login; o app pedia para ligá-la, o Shell respondia "não" e o app
+    ignorava a resposta. Agora, se o Shell não a conhece, o app pede para ele instalá-la (o
+    Shell carrega na hora, sem sair da sessão).
+    """
+
+    def setUp(self):
+        self.ext = A.USER_DATA / "gnome-shell" / "extensions" / A.USER_THEME_UUID
+        self.ext.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.ext, ignore_errors=True)
+
+    def test_shell_que_responde_nao_nao_conta_como_ligada(self):
+        self.assertFalse(A.enable_extension(A.USER_THEME_UUID, bus=ShellFalso(knows=False)))
+
+    def test_extensao_que_o_shell_nao_conhece_precisa_ser_carregada(self):
+        self.assertEqual(A.Desktop().ensure_user_theme(bus=ShellFalso(knows=False)), "carregar")
+
+    def test_extensao_carregada_fica_pronta(self):
+        self.assertEqual(A.Desktop().ensure_user_theme(bus=ShellFalso(knows=True)), "ok")
+
+    def test_sem_a_extensao_no_disco(self):
+        orig = A.extension_installed
+        A.extension_installed = lambda uuid: False  # o computador de teste pode tê-la em /usr/share
+        try:
+            self.assertEqual(A.Desktop().ensure_user_theme(bus=ShellFalso(knows=True)), "falta")
+        finally:
+            A.extension_installed = orig
+
 class ImagensDoTemaGtk4(unittest.TestCase):
     """
     Regressão: com o tema Dracula, os interruptores (liga/desliga) ficavam invisíveis em todos os

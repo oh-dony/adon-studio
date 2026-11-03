@@ -1,0 +1,6 @@
+{
+  "uuid": "adon-teste@adon.test",
+  "name": "Ajudante do teste do Adon Studio",
+  "description": "Só existe no contêiner de teste: libera o Eval e o Screenshot do Shell por D-Bus.",
+  "shell-version": ["42", "43", "44", "45", "46", "47", "48", "49"]
+}
