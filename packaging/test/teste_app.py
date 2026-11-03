@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Teste de fumaça: abre o app, passa por todas as abas, instala um pacote pela Loja e salva prints.
+# Teste de fumaça: abre o app, passa por todas as seções, instala um pacote pelo Explorar e salva prints.
 # Uso: python3 teste_app.py <pasta do adon_studio.py> <pasta de saída> [id do pacote]
 import sys
 import traceback
@@ -45,10 +45,20 @@ class T(A.App):
             self.quit()
 
         def install():
+            # Regressão: Adw.ResponseAppearance não existe na libadwaita 1.1 (Ubuntu 22.04) e derrubava
+            # as janelas de confirmar e de salvar estilo. Abrir as duas aqui pega isso.
+            for dlg in (A.confirm(win, "Teste", "Confirmar", "Ok", lambda: None),
+                        A.ask_text(win, "Teste", "Nome", "Salvar", "x", lambda t: None)):
+                dlg.close() if hasattr(dlg, "close") else dlg.destroy()
+            print("DIALOGOS: ok", flush=True)
+            # a cortina de verdade (tela cheia em cada monitor) abre e fecha sem erro
+            cortina = A.Curtain(win)
+            cortina.cover("#282828", lambda: (shot(win, "cortina"), cortina.uncover()))
+            print("CORTINA: ok", flush=True)
             item = win.store.items.get(PACK)
             if not item:
                 return finish(f"pacote {PACK} não está no catálogo ({len(win.store.items)} itens)")
-            win._pick_store(PACK)
+            win._install([PACK])  # instalar não aplica nada
 
             def check():
                 if win.busy:

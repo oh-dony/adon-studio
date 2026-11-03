@@ -5,10 +5,16 @@
 Troque o tema, os ícones, o cursor, o wallpaper e a barra de tarefas do seu computador vendo
 uma prévia de cada opção. Sem terminal e sem precisar entender de Linux.
 
-- **Combos**: visuais completos (tema + ícones + cursor + wallpaper) aplicados com um clique
-- **Loja**: dezenas de temas, ícones e cursores; clique em "Instalar" e pronto
-- **Barra**: dock flutuante, barra flutuante ou clássica, em todos os monitores
-- **Restaurar**: o app guarda o seu visual na primeira vez que abre; o botão ↶ volta para ele
+- **Escolha, veja, aplique**: clicar num item só mostra a prévia; nada muda até você clicar em
+  **Aplicar**. Dá para desmarcar partes (ex.: tudo menos o cursor) ou **Descartar**
+- **Estilos prontos**: visuais completos (tema + ícones + cursor + papel de parede)
+- **Cores**: escolha uma cor e receba paletas com papel de parede gerado (montanhas, ondas,
+  gradiente ou formas)
+- **Explorar**: dezenas de temas, ícones e cursores para baixar; instalar não muda seu visual
+- **Meus estilos**: salve o visual atual e volte a ele depois
+- **Barra e dock**: dock flutuante, barra flutuante ou clássica, em todos os monitores
+- **Desfazer e restaurar**: ↶ desfaz a última aplicação; no menu, "Voltar ao visual original"
+  volta ao que você tinha antes de abrir o app pela primeira vez
 
 ## Instalar
 
@@ -24,7 +30,7 @@ GNOME. (O Pop!_OS 24.04 usa o COSMIC no lugar do GNOME e não é compatível.)
 ## Créditos
 
 Os temas, ícones e cursores da Loja são de seus autores, redistribuídos conforme as licenças
-de cada um. A lista completa, com links, está em `Sobre` dentro do app e em
+de cada um. A lista completa, com links, está em `Sobre` dentro do app (e cada item do Explorar mostra autor, licença e origem) e em
 [packaging/sources.json](packaging/sources.json). Entre eles: Catppuccin, Dracula, Nordic,
 Papirus, Bibata, WhiteSur, Colloid, Fluent, Orchis, Qogir, Graphite, Gruvbox, Everforest,
 Rosé Pine, Kanagawa e Tokyo Night.

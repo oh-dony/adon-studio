@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Faz o que a pessoa faria: abre o Adon Studio, espera o catálogo da Loja e clica num combo.
+# Faz o que a pessoa faria: abre o Adon Studio, espera o catálogo, escolhe um estilo pronto e clica em Aplicar.
 # Uso: python3 aplica_combo.py <pasta do adon_studio.py> <pasta de saída> <nome do combo>
 import sys
 import traceback
@@ -35,13 +35,14 @@ class T(A.App):
                 return finish("tempo esgotado")
             if not state["clicked"]:
                 if COMBO in getattr(win, "packs", {}) and win.store.items:
-                    win.stack.set_visible_child_name("combos")
+                    win.go("estilos")
                     print("baixa:", [i["id"] for i in win.packs[COMBO]["need"]], flush=True)
                     state["antes"] = win.desk.iface.get_string("gtk-theme")
-                    win._pick_combo(COMBO)
+                    win._pick("estilos", COMBO)  # só seleciona
+                    win.apply()
                     state["clicked"] = True
                 return True
-            if win.busy or win.desk.iface.get_string("gtk-theme") == state["antes"]:
+            if win.busy or win.applying or win.desk.iface.get_string("gtk-theme") == state["antes"]:
                 return True
             # espera o ✓ do cartão (o combo é aplicado ~1s depois do download)
             state.setdefault("wait", state["t"] + 8)

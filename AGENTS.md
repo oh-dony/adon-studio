@@ -2,8 +2,8 @@
 
 Leia o [README.md](README.md) antes de mexer no código. O app inteiro é um arquivo,
 [adon_studio.py](adon_studio.py) (Python + GTK4/libadwaita), dividido em seções:
-configurações (`Desktop`), descoberta de temas, Loja (`Store`), desenho das prévias,
-combos e interface (`Window`).
+configurações (`Desktop`), descoberta de temas, Loja/Explorar (`Store`), desenho das prévias,
+estilos prontos, seleção pendente (`Selection`) e interface (`Window`).
 
 ## Regra nº 1: todo bug vira teste automatizado
 
@@ -62,6 +62,9 @@ Dicas:
   Pop!_OS 22.04). Nada de `Adw.SwitchRow`, `Adw.SpinRow`, `Adw.ToolbarView`,
   `Gtk.FileDialog` etc. sem alternativa: use os atalhos `switch_row`, `spin_row`,
   `picture`, `confirm` ou um `hasattr`.
+- **Clicar nunca aplica.** Toda mudança no sistema vira um `Change` na `Selection` e só roda no
+  botão Aplicar (que guarda antes o ponto de "Desfazer"). Erro num componente vira relatório, não
+  trava os outros.
 - **Tudo na pasta do usuário, sem sudo.** Temas em `~/.local/share/themes`, ícones e
   cursores em `~/.local/share/icons` (cursores também ganham atalho em `~/.icons`).
 - **A barra guarda ajustes por monitor** (`fabricante-serial`). Use `bar_set`, que aplica

@@ -28,6 +28,8 @@ USER_DATA = Path(GLib.get_user_data_dir())
 SYS_DATA = [Path(d) for d in GLib.get_system_data_dirs()]
 DATA = USER_DATA / "adon-studio"
 BACKUP = DATA / "original"
+PREVIOUS = DATA / "anterior"  # antes da última aplicação, para "Desfazer"
+MY_STYLES = DATA / "meus-estilos.json"
 WALLS = USER_DATA / "backgrounds" / "adon-studio"
 GTK4_CFG = Path(GLib.get_user_config_dir()) / "gtk-4.0"
 GTK4_FILES = ("gtk.css", "gtk-dark.css", "assets")
@@ -179,11 +181,15 @@ class Desktop:
             "taskbar": (self.bar, TASKBAR_KEYS),
         }
 
-    # --- ponto de restauração
+    # --- pontos de restauração: o original (primeira abertura) e o de antes da última aplicação
     def ensure_backup(self):
-        if (BACKUP / "settings.json").exists():
-            return
-        BACKUP.mkdir(parents=True, exist_ok=True)
+        if not (BACKUP / "settings.json").exists():
+            self.snapshot(BACKUP)
+
+    def snapshot(self, dest):
+        """Guarda em `dest` tudo o que o app pode mudar, para restore_from voltar depois."""
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir(parents=True, exist_ok=True)
         values = {}
         for group, (s, keys) in self.tracked.items():
             if s:
@@ -194,20 +200,32 @@ class Desktop:
             if p.is_symlink():
                 gtk4[name] = {"link": str(p.readlink())}
             elif p.is_file():
-                shutil.copy2(p, BACKUP / name)
+                shutil.copy2(p, dest / name)
                 gtk4[name] = {"file": name}
             elif p.is_dir():
-                shutil.copytree(p, BACKUP / name, dirs_exist_ok=True)
+                shutil.copytree(p, dest / name, dirs_exist_ok=True)
                 gtk4[name] = {"dir": name}
         values["gtk4"] = gtk4
-        values["blur"] = Blur().snapshot() if Blur.installed() else None
+        values["blur"] = Blur().snapshot() if Blur.installed() and Blur().root else None
         values["cursor-default"] = CURSOR_DEFAULT.exists()
         if CURSOR_DEFAULT.exists():
-            shutil.copytree(CURSOR_DEFAULT, BACKUP / "cursor-default", dirs_exist_ok=True)
-        (BACKUP / "settings.json").write_text(json.dumps(values, indent=2))
+            shutil.copytree(CURSOR_DEFAULT, dest / "cursor-default", dirs_exist_ok=True)
+        (dest / "settings.json").write_text(json.dumps(values, indent=2))
 
     def restore(self):
-        values = json.loads((BACKUP / "settings.json").read_text())
+        self.restore_from(BACKUP)
+
+    @staticmethod
+    def has_previous():
+        return (PREVIOUS / "settings.json").exists()
+
+    def undo(self):
+        """Volta ao que estava antes da última aplicação (um nível só)."""
+        self.restore_from(PREVIOUS)
+        shutil.rmtree(PREVIOUS, ignore_errors=True)
+
+    def restore_from(self, src):
+        values = json.loads((src / "settings.json").read_text())
         for group, (s, keys) in self.tracked.items():
             if not s:
                 continue
@@ -227,16 +245,17 @@ class Desktop:
             if "link" in info:
                 dest.symlink_to(info["link"])
             elif "file" in info:
-                shutil.copy2(BACKUP / name, dest)
+                shutil.copy2(src / name, dest)
             elif "dir" in info:
-                shutil.copytree(BACKUP / name, dest)
+                shutil.copytree(src / name, dest)
         blur = Blur()
         if blur.root:
             blur.restore(values.get("blur"))
         shutil.rmtree(CURSOR_DEFAULT, ignore_errors=True)
         if values.get("cursor-default"):
-            shutil.copytree(BACKUP / "cursor-default", CURSOR_DEFAULT)
+            shutil.copytree(src / "cursor-default", CURSOR_DEFAULT)
         Gio.Settings.sync()
+        reload_files_app()
 
     # --- aplicar
     @staticmethod
@@ -260,7 +279,7 @@ class Desktop:
         return "carregar" if shell_extension_info(USER_THEME_UUID, bus) == {} else "falta"
 
     def apply_gtk(self, theme):
-        self.iface.set_string("color-scheme", "prefer-light" if "light" in theme.name.lower() else "prefer-dark")
+        self.iface.set_string("color-scheme", "prefer-dark" if is_dark(theme_palette(theme)) else "prefer-light")
         self.iface.set_string("gtk-theme", theme.name)
         if self.shell:
             self.shell.set_string("name", theme.name if (theme.path / "gnome-shell").is_dir() else "")
@@ -334,8 +353,9 @@ class Desktop:
         GTK4_CFG.mkdir(parents=True, exist_ok=True)
         (GTK4_CFG / "gtk.css").write_text(palette_css(pal))
         WALLS.mkdir(parents=True, exist_ok=True)
-        wall = WALLS / f"cor-{pal['accent'][1:]}-{pal['key']}.svg"
-        wall.write_text(wall_svg(*pal["wall"]))
+        design, seed = pal.get("design"), pal.get("seed", 0)
+        wall = WALLS / f"cor-{pal['accent'][1:]}-{pal['key']}{f'-{design}-{seed}' if design else ''}.svg"
+        wall.write_text(design_svg(pal["wall"], design, seed) if design else wall_svg(*pal["wall"]))
         self.apply_wallpaper(wall)
         reload_files_app()
         return wall
@@ -361,6 +381,40 @@ class Desktop:
     def bar_set_plain(self, key, value):
         if has_key(self.bar, key):
             self.bar.set_value(key, GLib.Variant(self.bar.get_value(key).get_type_string(), value))
+
+    def _plain(self, key, default):
+        return self.bar.get_value(key).unpack() if has_key(self.bar, key) else default
+
+    def bar_read(self):
+        """Ajustes da barra como estão no sistema (rascunho inicial da aba Barra e dock)."""
+        return dict(position=self.bar_get("panel-positions", "BOTTOM"), length=self.bar_get("panel-lengths", 100),
+                    size=self.bar_get("panel-sizes", 48), margin=self._plain("panel-margin", 0),
+                    radius=self._plain("global-border-radius", 0),
+                    custom=self._plain("trans-use-custom-opacity", False),
+                    opacity=round(self._plain("trans-panel-opacity", 1.0), 2), hide=self._plain("intellihide", False))
+
+    def bar_write(self, d):
+        """Grava só o que mudou em relação ao sistema, em todos os monitores."""
+        cur = self.bar_read()
+        per_monitor = {"position": "panel-positions", "length": "panel-lengths", "size": "panel-sizes"}
+        plain = {"margin": "panel-margin", "radius": "global-border-radius", "custom": "trans-use-custom-opacity",
+                 "opacity": "trans-panel-opacity", "hide": "intellihide"}
+        for k, v in d.items():
+            if cur.get(k) == v:
+                continue
+            if k in per_monitor:
+                self.bar_set(per_monitor[k], v)
+                if k == "length":
+                    self.bar_set("panel-anchors", "MIDDLE")  # barra compacta fica centralizada
+            elif k in plain:
+                self.bar_set_plain(plain[k], v)
+
+    def current(self):
+        """O que está em uso agora: tema, ícones, cursor e wallpaper."""
+        uri = self.bg.get_string("picture-uri") if self.bg else ""
+        return dict(gtk=self.iface.get_string("gtk-theme"), icons=self.iface.get_string("icon-theme"),
+                    cursor=self.iface.get_string("cursor-theme"),
+                    wallpaper=Gio.File.new_for_uri(uri).get_path() if uri else None)
 
 
 # ---------------------------------------------------------------- descoberta
@@ -391,6 +445,14 @@ def _index(d):
         return None
 
 
+def _hidden(kf):
+    """Hidden=true: tema de uso interno (ex.: as pastas coloridas da paleta), não é para escolher."""
+    try:
+        return kf.get_boolean("Icon Theme", "Hidden")
+    except GLib.Error:
+        return False
+
+
 def list_icon_themes():
     found = {}
     for base in ICON_DIRS:
@@ -399,7 +461,7 @@ def list_icon_themes():
                 continue
             kf = _index(d)
             try:
-                if kf and kf.get_string("Icon Theme", "Directories"):
+                if kf and not _hidden(kf) and kf.get_string("Icon Theme", "Directories"):
                     found[d.name] = d
             except GLib.Error:
                 pass
@@ -428,6 +490,8 @@ def list_wallpapers():
 # ---------------------------------------------------------------- loja
 
 KIND_LABEL = {"gtk": "Tema", "icons": "Ícones", "cursors": "Cursor"}
+KIND_ICON = {"gtk": "preferences-desktop-appearance-symbolic", "icons": "folder-pictures-symbolic",
+             "cursors": "input-mouse-symbolic"}
 
 
 def _http_get(url, dest=None, progress=None):
@@ -463,7 +527,7 @@ def _safe_members(tf, dest):
 
 class Store:
     def __init__(self):
-        self.items = {}
+        self.items, self.failed, self.offline = {}, {}, False
         CACHE.mkdir(parents=True, exist_ok=True)
         self._base = CATALOG_URL.rsplit("/", 1)[0] + "/"
 
@@ -475,8 +539,10 @@ class Store:
                 data = _http_get(CATALOG_URL)
                 json.loads(data)
                 cached.write_bytes(data)
+                self.offline = False
             except (OSError, ValueError):
                 data = cached.read_bytes() if cached.exists() else None
+                self.offline = True
             self.items = {i["id"]: i for i in json.loads(data)["items"]} if data else {}
             GLib.idle_add(lambda: done(bool(self.items)) or False)
         POOL.submit(work)
@@ -513,13 +579,15 @@ class Store:
         POOL.submit(work)
 
     def install(self, items, progress, done):
-        """Instala uma lista de itens em sequência. progress(fração 0..1), done(erro ou None)."""
+        """Instala uma lista de itens em sequência; um item com erro não impede os outros.
+        progress(fração 0..1), done(None ou texto com o que falhou). Os erros por item ficam em
+        self.failed ({id: motivo})."""
         def work():
-            try:
-                total = sum(i["bytes"] for i in items) or 1
-                before = 0
-                for item in items:
-                    part = CACHE / (item["file"] + ".part")
+            total = sum(i["bytes"] for i in items) or 1
+            before, failed = 0, {}
+            for item in items:
+                part = CACHE / (item["file"] + ".part")
+                try:
                     _http_get(self._base + item["file"], part,
                               lambda f, b=before, s=item["bytes"]: GLib.idle_add(progress, (b + f * s) / total))
                     h = hashlib.sha256()
@@ -528,7 +596,7 @@ class Store:
                             h.update(chunk)
                     if h.hexdigest() != item["sha256"]:
                         part.unlink()
-                        raise OSError(f"o arquivo de {item['title']} veio corrompido")
+                        raise OSError("o arquivo veio corrompido")
                     dest = STORE_DIRS[item["kind"]]
                     dest.mkdir(parents=True, exist_ok=True)
                     with tarfile.open(part, "r:xz") as tf:
@@ -536,10 +604,13 @@ class Store:
                         kw = {"filter": "fully_trusted"} if hasattr(tarfile, "data_filter") else {}
                         tf.extractall(dest, members=members, **kw)
                     part.unlink()
-                    before += item["bytes"]
-                err = None
-            except (OSError, tarfile.TarError) as e:
-                err = str(e)
+                except (OSError, tarfile.TarError) as e:
+                    failed[item["id"]] = str(getattr(e, "reason", None) or e)
+                    part.unlink(missing_ok=True)
+                before += item["bytes"]
+            self.failed = failed
+            names = {i["id"]: i["title"] for i in items}
+            err = "; ".join(f"{names[k]}: {v}" for k, v in failed.items()) or None
             GLib.idle_add(lambda: done(err) or False)
         POOL.submit(work)
 
@@ -750,10 +821,27 @@ class Blur:
         self.set_strength(p["radius"], p["brightness"])
         self.adapt(zorin)
 
+    def read(self):
+        """Como o vidro está agora, no formato dos presets (rascunho inicial da aba Efeitos)."""
+        radius, bright = self.strength()
+        apps = self.parts.get("applications")
+        return dict(parts=[p for p, _t, _s in BLUR_PARTS if self.get(p)], windows=self.windows(), radius=radius,
+                    brightness=bright, opacity=apps.get_int("opacity") if has_key(apps, "opacity") else 215)
+
+    def write(self, d, zorin):
+        self.apply_preset(d, zorin)
+        apps = self.parts.get("applications")
+        if "opacity" in d and has_key(apps, "opacity") and d["windows"] != "nenhuma":
+            apps.set_int("opacity", int(d["opacity"]))
+
     def snapshot(self):
         s = self.parts.get("popup")
         extra = {"_preserve": s.get_boolean("preserve-shell-theme")} if has_key(s, "preserve-shell-theme") else {}
-        return {p: self.get(p) for p in self.parts} | {"_windows": self.windows()} | extra
+        apps = self.parts.get("applications")
+        if has_key(apps, "opacity"):
+            extra["_opacity"] = apps.get_int("opacity")
+        return {p: self.get(p) for p in self.parts} | {"_windows": self.windows(),
+                                                       "_strength": list(self.strength())} | extra
 
     def restore(self, saved):
         """Volta ao que estava no backup; sem backup do vidro, desliga tudo."""
@@ -765,6 +853,11 @@ class Blur:
         s = self.parts.get("popup")
         if has_key(s, "preserve-shell-theme"):
             s.set_boolean("preserve-shell-theme", saved.get("_preserve", False))
+        if "_strength" in saved:
+            self.set_strength(*saved["_strength"])
+        apps = self.parts.get("applications")
+        if "_opacity" in saved and has_key(apps, "opacity"):
+            apps.set_int("opacity", saved["_opacity"])
 
 
 # ---------------------------------------------------------------- cores e desenho
@@ -809,7 +902,9 @@ def theme_palette(theme):
                 return c
         return None
 
-    dark = "light" not in theme.name.lower()
+    low = theme.name.lower()
+    # sem cores no CSS, só o nome ajuda: "dark" no nome é escuro; o resto (Adwaita, Yaru...) é claro
+    dark = "dark" in low or ("light" not in low and any(w in low for w in ("dracula", "nord", "noir", "black")))
     bg = get("window_bg_color", "theme_bg_color", "bg_color")
     if not bg:
         m = BG_RULE.search(css)
@@ -822,6 +917,12 @@ def theme_palette(theme):
         word = next((w for w in NAMED_ACCENTS if w in theme.name.lower()), "blue")
         acc = rgba(NAMED_ACCENTS[word])
     return bg, base, fg, acc
+
+
+def is_dark(pal):
+    """Pelo fundo lido do tema (o Adwaita, por exemplo, é claro sem ter "light" no nome)."""
+    bg = pal[0]
+    return .2126 * bg.red + .7152 * bg.green + .0722 * bg.blue < .45
 
 
 def _src(cr, c, a=1.0):
@@ -914,21 +1015,45 @@ ICON_SAMPLES = [["folder", "inode-directory"], ["user-home", "folder-home"],
                 ["org.gnome.Settings", "preferences-system", "gnome-control-center"],
                 ["accessories-text-editor", "org.gnome.TextEditor", "text-editor"],
                 ["user-trash-full", "user-trash"]]
+ICON_LABELS = ["Pasta", "Pasta pessoal", "Navegador", "Terminal", "Configurações", "Editor de texto", "Lixeira"]
 
 
-def icon_preview(name, size=34):
+def icon_theme(name):
     theme = Gtk.IconTheme()
     theme.set_search_path([str(d) for d in ICON_DIRS] + ["/usr/share/pixmaps"])
     theme.set_theme_name(name)
+    return theme
+
+
+def icon_paintables(name, size, samples=ICON_SAMPLES):
+    theme = icon_theme(name)
+    return [theme.lookup_icon(n[0], n[1:], size, 1, Gtk.TextDirection.NONE, 0) for n in samples]
+
+
+def icon_preview(name, size=32, count=5):
+    """Sempre os mesmos aplicativos, na mesma ordem, para dar para comparar os temas."""
     box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=10, margin_bottom=10)
-    for names in ICON_SAMPLES:
-        paint = theme.lookup_icon(names[0], names[1:], size, 1, Gtk.TextDirection.NONE, 0)
+    for paint in icon_paintables(name, size, ICON_SAMPLES[:count]):
         box.append(Gtk.Image(paintable=paint, pixel_size=size))
     return box
 
 
-CURSOR_SAMPLES = [["left_ptr", "default", "arrow"], ["hand2", "pointer", "pointing_hand"],
-                  ["xterm", "text", "ibeam"], ["watch", "wait"], ["fleur", "move", "grabbing"]]
+def labeled_samples(images, labels, size):
+    """Grade de amostras grandes com o nome de cada uma embaixo (prévia ampliada)."""
+    flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, max_children_per_line=4,
+                       min_children_per_line=2, column_spacing=8, row_spacing=12)
+    for img, label in zip(images, labels):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.append(img or Gtk.Image(icon_name="image-missing-symbolic", pixel_size=size))
+        box.append(Gtk.Label(label=label, wrap=True, justify=Gtk.Justification.CENTER, css_classes=["caption"]))
+        flow.append(box)
+    return flow
+
+
+# ponteiro, seleção de texto, link e carregando primeiro: são os que a pessoa mais vê
+CURSOR_SAMPLES = [["left_ptr", "default", "arrow"], ["xterm", "text", "ibeam"],
+                  ["hand2", "pointer", "pointing_hand"], ["watch", "wait", "progress"], ["fleur", "move", "grabbing"]]
+CURSOR_LABELS = ["Ponteiro", "Texto", "Link", "Carregando", "Mover"]
 
 
 def load_xcursor(path, want=32):
@@ -947,16 +1072,24 @@ def load_xcursor(path, want=32):
     return Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED, px, w * 4)
 
 
-def cursor_preview(path):
-    box = Gtk.Box(spacing=14, halign=Gtk.Align.CENTER, margin_top=10, margin_bottom=10)
-    for names in CURSOR_SAMPLES:
+def cursor_textures(path, want=32, count=4):
+    out = []
+    for names in CURSOR_SAMPLES[:count]:
         f = next((path / "cursors" / n for n in names if (path / "cursors" / n).exists()), None)
         try:
-            tex = load_xcursor(f.resolve()) if f else None
+            out.append(load_xcursor(f.resolve(), want) if f else None)
         except (OSError, struct.error):
-            tex = None
-        if tex:
-            box.append(Gtk.Image(paintable=tex, pixel_size=32))
+            out.append(None)
+    return out
+
+
+def cursor_preview(path, count=4):
+    box = Gtk.Box(spacing=14, halign=Gtk.Align.CENTER, margin_top=10, margin_bottom=10)
+    for tex, label in zip(cursor_textures(path, 32, count), CURSOR_LABELS):
+        img = Gtk.Image(paintable=tex, pixel_size=32) if tex else \
+            Gtk.Image(icon_name="image-missing-symbolic", pixel_size=24)
+        img.set_tooltip_text(label)
+        box.append(img)
     return box
 
 
@@ -1022,8 +1155,271 @@ def wall_svg(c1, c2, g1, g2):
 '''
 
 
+# Modelos de papel de parede desenhados aqui mesmo (sem arquivos de terceiros, sem licença a conferir).
+# Cada cor tem um papel: fundo, céu, camadas e brilho saem da paleta, então o mesmo desenho combina
+# com qualquer cor. A semente muda o desenho de um jeito reproduzível ("Variar desenho").
+WALL_DESIGNS = [("entardecer", "Entardecer"), ("montanhas", "Montanhas"), ("ondas", "Ondas"), ("gradiente", "Gradiente"), ("formas", "Formas")]
+
+
+def blend(a, b, t):
+    ca, cb = rgba(a), rgba(b)
+    return "#%02x%02x%02x" % tuple(round((x + (y - x) * t) * 255) for x, y in
+                                   ((ca.red, cb.red), (ca.green, cb.green), (ca.blue, cb.blue)))
+
+
+def design_svg(colors, design="montanhas", seed=0):
+    """SVG 4K de um dos WALL_DESIGNS com as cores (fundo 1, fundo 2, destaque, 2º tom)."""
+    import random
+    if design == "entardecer":
+        return scene_dusk(colors, seed)
+    c1, c2, g1, g2 = colors
+    rnd = random.Random(f"{design}-{seed}")
+    W, H = 3840, 2160
+    light = luminance(c1) > .4
+    shade = "#ffffff" if light else "#000000"
+    defs = (f'<linearGradient id="fundo" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{c2}"/>'
+            f'<stop offset="1" stop-color="{blend(c1, g1, .35)}"/></linearGradient>')
+    body = '<rect width="3840" height="2160" fill="url(#fundo)"/>'
+    if design == "montanhas":
+        # perspectiva atmosférica: o céu clareia no horizonte, as serras do fundo quase somem nele e
+        # a da frente é sempre a mais escura (no claro e no escuro)
+        if light:
+            sky_top, horizon, deep = blend(c2, g1, .35), blend(c1, "#ffffff", .3), blend(g1, "#000000", .45)
+        else:
+            sky_top, horizon, deep = blend(c2, "#000000", .3), blend(c1, g1, .4), blend(c1, g1, .1)
+        defs = (f'<linearGradient id="fundo" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{sky_top}"/>'
+                f'<stop offset=".62" stop-color="{horizon}"/></linearGradient>'
+                f'<radialGradient id="luz"><stop offset="0" stop-color="{g2}" stop-opacity=".45"/>'
+                f'<stop offset=".35" stop-color="{g2}" stop-opacity=".12"/>'
+                f'<stop offset="1" stop-color="{g2}" stop-opacity="0"/></radialGradient>')
+        body = '<rect width="3840" height="2160" fill="url(#fundo)"/>'
+        sx, sy = rnd.uniform(.18, .82) * W, rnd.uniform(.2, .32) * H
+        body += f'<circle cx="{sx:.0f}" cy="{sy:.0f}" r="1100" fill="url(#luz)"/>'
+        body += f'<circle cx="{sx:.0f}" cy="{sy:.0f}" r="150" fill="{blend(g2, horizon, .55 if light else .3)}"/>'
+        far = blend(horizon, g1, .3)
+        layers = 5
+        for i in range(layers):
+            t = i / (layers - 1)
+            top_c = blend(far, deep, .12 + t * .88)
+            bottom_c = blend(top_c, deep, .35)
+            defs += (f'<linearGradient id="s{i}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{top_c}"/>'
+                     f'<stop offset="1" stop-color="{bottom_c}"/></linearGradient>')
+            base, amp = H * (.5 + t * .3), H * (.2 - t * .1)
+            # poucos pontos de controle (deslocamento do ponto médio) ligados por curvas: morros
+            # suaves, de alturas variadas, sem pontas finas
+            n = 16
+            ys = [0.0] * (n + 1)
+            ys[0], ys[n] = rnd.uniform(-.4, .4), rnd.uniform(-.4, .4)
+            step, rough = n, 1.0
+            while step > 1:
+                half = step // 2
+                for k in range(half, n, step):
+                    ys[k] = (ys[k - half] + ys[k + half]) / 2 + rnd.uniform(-1, 1) * rough
+                step, rough = half, rough * .45
+            lo, hi = min(ys), max(ys)
+            pts = [(W * k / n, base - (ys[k] - lo) / ((hi - lo) or 1) * amp) for k in range(n + 1)]
+            d = f"M{pts[0][0]:.0f} {pts[0][1]:.0f}"
+            for k in range(n):  # Catmull-Rom → Bézier cúbica
+                p0, p1, p2, p3 = pts[max(k - 1, 0)], pts[k], pts[k + 1], pts[min(k + 2, n)]
+                d += (f" C{p1[0] + (p2[0] - p0[0]) / 6:.0f} {p1[1] + (p2[1] - p0[1]) / 6:.0f} "
+                      f"{p2[0] - (p3[0] - p1[0]) / 6:.0f} {p2[1] - (p3[1] - p1[1]) / 6:.0f} {p2[0]:.0f} {p2[1]:.0f}")
+            body += f'<path class="serra" fill="url(#s{i})" d="{d} L{W} {H} L0 {H} Z"/>'
+    elif design == "ondas":
+        layers = [blend(g1, c1, .55), blend(g2, c1, .45), g1, blend(c2, shade, .3)]
+        for i, fill in enumerate(layers):
+            y = 1150 + i * 260 + rnd.uniform(-60, 60)
+            a1, a2 = rnd.uniform(120, 320), rnd.uniform(120, 320)
+            body += (f'<path d="M0 {y:.0f} C960 {y - a1:.0f} 1920 {y + a2:.0f} 2880 {y - a2 * .6:.0f} '
+                     f'S3840 {y + a1 * .4:.0f} 3840 {y:.0f} V2160 H0 Z" fill="{fill}" fill-opacity=".92"/>')
+    elif design == "gradiente":
+        for i, c in enumerate((g1, g2, g1)):
+            defs += (f'<radialGradient id="m{i}"><stop offset="0" stop-color="{c}" stop-opacity="{.6 - i * .12:.2f}"/>'
+                     f'<stop offset="1" stop-color="{c}" stop-opacity="0"/></radialGradient>')
+            body += (f'<circle cx="{rnd.uniform(.1, .9) * W:.0f}" cy="{rnd.uniform(.15, .85) * H:.0f}" '
+                     f'r="{rnd.uniform(900, 1500):.0f}" fill="url(#m{i})"/>')
+    else:  # formas
+        for i in range(rnd.randint(7, 10)):
+            c = (g1, g2, blend(g1, c1, .4))[i % 3]
+            x, y, r = rnd.uniform(0, W), rnd.uniform(0, H), rnd.uniform(140, 520)
+            op = rnd.uniform(.25, .7)
+            if i % 3 == 2:
+                body += (f'<circle cx="{x:.0f}" cy="{y:.0f}" r="{r:.0f}" fill="none" stroke="{c}" '
+                         f'stroke-width="28" stroke-opacity="{op:.2f}"/>')
+            elif i % 3 == 1:
+                body += (f'<rect x="{x - r:.0f}" y="{y - r:.0f}" width="{r * 2:.0f}" height="{r * 2:.0f}" '
+                         f'rx="{r * .3:.0f}" fill="{c}" fill-opacity="{op:.2f}" '
+                         f'transform="rotate({rnd.uniform(-30, 30):.0f} {x:.0f} {y:.0f})"/>')
+            else:
+                body += f'<circle cx="{x:.0f}" cy="{y:.0f}" r="{r:.0f}" fill="{c}" fill-opacity="{op:.2f}"/>'
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">'
+            f'<!-- {APP_NAME}: {design} {seed} --><defs>{defs}</defs>{body}</svg>\n')
+
+
+# ---------------------------------------------------------------- paisagens ilustradas
+
+# Cada elemento tem um papel na cena e o papel fixa a luminosidade e a saturação; da paleta vem só
+# o tom (destaque = tom frio da cena, 2º tom = tom quente da luz). Assim qualquer paleta mantém a
+# profundidade: céu e picos distantes claros, montanhas do meio médias, pinheiros escuros.
+LANDSCAPE_DEFAULT = ("#f3e6ef", "#d9c8e6", "#9a86d6", "#f6b38c")  # lavanda e pêssego
+SCENE_ROLES = {  # papel: (tom: "frio"/"quente"/"meio", luminosidade, saturação)
+    "ceu_alto": ("frio", .66, .38), "ceu_meio": ("meio", .78, .50), "horizonte": ("quente", .86, .80),
+    "sol": ("quente", .93, .90), "pico": ("frio", .72, .24), "pico_luz": ("quente", .87, .45),
+    "serra": ("frio", .60, .26), "meio": ("frio", .44, .30), "perto": ("frio", .30, .30),
+    "pinheiro_longe": ("frio", .21, .28), "pinheiro": ("frio", .12, .30),
+}
+
+
+def scene_colors(colors):
+    """Cor de cada papel a partir da paleta. Paleta escura vira um entardecer mais tarde (tudo mais
+    escuro, na mesma proporção), sem inverter a ordem de claro para escuro."""
+    c1, _c2, g1, g2 = colors
+    cold, warm = hex_hls(g1)[0], hex_hls(g2)[0]
+    if abs(cold - warm) < .04 or abs(cold - warm) > .96:  # paleta de um tom só: a luz puxa para o quente
+        warm = (cold + .08) % 1
+    mid = (cold + ((warm - cold + .5) % 1 - .5) / 2) % 1
+    dim = .62 if luminance(c1) < .4 else 1.0
+    tones = {"frio": cold, "quente": warm, "meio": mid}
+    out = {role: hls_hex(tones[t], l * (dim if role not in ("sol", "horizonte") else (1 + dim) / 2), s)
+           for role, (t, l, s) in SCENE_ROLES.items()}
+    # a luz nos picos é a luz do horizonte refletida: puxa para ele, não para um tom saturado
+    out["pico_luz"] = blend(out["pico_luz"], out["horizonte"], .5)
+    out["noite"] = dim < 1
+    return out
+
+
+def _pine(x, base, h, w):
+    """Pinheiro: cinco andares de galhos sobrepostos, com o recorte do galho em cada lado."""
+    pts = []
+    for t in range(5):
+        top = base - h + t * h * .17
+        th, tw = h * .3, w * (.35 + t * .16)
+        pts.append(f'<polygon points="{x:.0f},{top:.0f} {x + tw * .28:.0f},{top + th * .55:.0f} '
+                   f'{x + tw * .2:.0f},{top + th * .6:.0f} {x + tw / 2:.0f},{top + th:.0f} '
+                   f'{x - tw / 2:.0f},{top + th:.0f} {x - tw * .2:.0f},{top + th * .6:.0f} '
+                   f'{x - tw * .28:.0f},{top + th * .55:.0f}"/>')
+    pts.append(f'<rect x="{x - w * .04:.0f}" y="{base - h * .06:.0f}" width="{w * .08:.0f}" height="{h * .08:.0f}"/>')
+    return "".join(pts)
+
+
+def _smooth(points):
+    """Caminho suave (Catmull-Rom) pelos pontos."""
+    d = f"M{points[0][0]:.0f} {points[0][1]:.0f}"
+    n = len(points) - 1
+    for k in range(n):
+        p0, p1, p2, p3 = points[max(k - 1, 0)], points[k], points[k + 1], points[min(k + 2, n)]
+        d += (f" C{p1[0] + (p2[0] - p0[0]) / 6:.0f} {p1[1] + (p2[1] - p0[1]) / 6:.0f} "
+              f"{p2[0] - (p3[0] - p1[0]) / 6:.0f} {p2[1] - (p3[1] - p1[1]) / 6:.0f} {p2[0]:.0f} {p2[1]:.0f}")
+    return d
+
+
+def scene_dusk(colors, seed=0):
+    """Montanhas ao entardecer. Detalhe nas bordas e embaixo; o centro fica com céu e vale baixo."""
+    import random
+    rnd = random.Random(f"entardecer-{seed}")
+    W, H = 3840, 2160
+    c = scene_colors(colors)
+    g2 = colors[3]
+    sun_x = W * rnd.uniform(.4, .6)
+    sun_y = H * .5
+    edge = lambda x: abs(x / W - .5) * 2  # 0 no centro, 1 nas bordas  # noqa: E731
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">',
+           f'<!-- {APP_NAME}: entardecer {seed} -->',
+           '<defs>',
+           f'<linearGradient id="ceu" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{c["ceu_alto"]}"/>'
+           f'<stop offset=".45" stop-color="{c["ceu_meio"]}"/><stop offset=".62" stop-color="{c["horizonte"]}"/></linearGradient>',
+           f'<radialGradient id="brilho"><stop offset="0" stop-color="{c["sol"]}" stop-opacity=".9"/>'
+           f'<stop offset=".25" stop-color="{g2}" stop-opacity=".35"/><stop offset="1" stop-color="{g2}" stop-opacity="0"/>'
+           '</radialGradient>',
+           f'<linearGradient id="nevoa" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{c["horizonte"]}" '
+           f'stop-opacity="0"/><stop offset=".6" stop-color="{c["horizonte"]}" stop-opacity=".28"/>'
+           f'<stop offset="1" stop-color="{c["horizonte"]}" stop-opacity="0"/></linearGradient>',
+           '</defs>']
+    # céu
+    stars = ""
+    if c["noite"]:  # paleta escura: o entardecer já virou noite, com estrelas no alto do céu
+        stars = "".join(f'<circle cx="{rnd.uniform(0, W):.0f}" cy="{rnd.uniform(0, H * .4) ** 1.1 / (H * .4) ** .1:.0f}" '
+                        f'r="{rnd.uniform(2, 5):.1f}" fill="{c["sol"]}" opacity="{rnd.uniform(.3, .85):.2f}"/>'
+                        for _ in range(140))
+    out.append(f'<g id="ceu"><rect width="{W}" height="{H}" fill="url(#ceu)"/>{stars}</g><!-- /ceu -->')
+    # luz: sol baixo atrás do vale, brilho largo e suave
+    out.append(f'<g id="luz"><circle cx="{sun_x:.0f}" cy="{sun_y:.0f}" r="1300" fill="url(#brilho)"/>'
+               f'<circle cx="{sun_x:.0f}" cy="{sun_y:.0f}" r="120" fill="{c["sol"]}"/></g><!-- /luz -->')
+    # distantes: picos altos nas bordas, baixos no meio; a face virada para o sol é iluminada
+    peaks = []
+    for fx in (.03, .13, .24, .36, .64, .76, .87, .97):
+        x = W * (fx + rnd.uniform(-.02, .02))
+        y = H * (.62 - .3 * edge(x) ** 1.3 - rnd.uniform(0, .05))
+        peaks.append((x, y))
+    ridge, light, rims = [(0, peaks[0][1] + H * .06)], [], []
+    valleys = []
+    for i, (x, y) in enumerate(peaks):
+        nxt = peaks[i + 1] if i + 1 < len(peaks) else (W, H * .6)
+        valley = ((x + nxt[0]) / 2 + rnd.uniform(-60, 60), max(y, nxt[1]) + rnd.uniform(90, 200))
+        shoulder = (x + (valley[0] - x) * .45, y + (valley[1] - y) * .35 + rnd.uniform(-25, 25))
+        ridge += [(x, y), shoulder, valley]
+        valleys.append(valley)
+    for i, (x, y) in enumerate(peaks):
+        # face virada para o sol: um triângulo estreito entre o cume, a encosta e o eixo do pico
+        if x < sun_x:
+            vx, vy = valleys[i]
+        else:
+            vx, vy = valleys[i - 1] if i else (0, H * .62)
+        sx_, sy_ = x + (vx - x) * .5, y + (vy - y) * .5
+        ix, iy = x + (vx - x) * .1, y + (vy - y) * .8
+        light.append(f'<polygon fill="{c["pico_luz"]}" points="{x:.0f},{y:.0f} {sx_:.0f},{sy_:.0f} {ix:.0f},{iy:.0f}"/>')
+        rims.append(f'<path d="M{x:.0f} {y:.0f} L{sx_:.0f} {sy_:.0f}" stroke="{c["sol"]}" stroke-width="7" '
+                    f'stroke-linecap="round" fill="none" opacity=".55"/>')
+    ridge.append((W, peaks[-1][1] + H * .06))  # sem degrau reto na borda
+    pts = " ".join(f"{x:.0f},{y:.0f}" for x, y in ridge)
+    far = f'<polygon fill="{c["pico"]}" points="{pts} {W},{H} 0,{H}"/>' + "".join(light)
+    # segunda serra, um pouco mais escura, também mais alta nas bordas
+    serra = [(W * k / 12, H * (.7 - .12 * edge(W * k / 12) - rnd.uniform(0, .04))) for k in range(13)]
+    far += f'<path fill="{c["serra"]}" d="{_smooth(serra)} L{W} {H} L0 {H} Z"/>'
+    far += f'<rect y="{H * .55:.0f}" width="{W}" height="{H * .2:.0f}" fill="url(#nevoa)"/>'
+    out.append(f'<g id="distantes">{far}</g><!-- /distantes -->')
+    # intermediárias: morros violeta
+    mid = [(W * k / 10, H * (.78 - .1 * edge(W * k / 10) - rnd.uniform(0, .04))) for k in range(11)]
+    out.append(f'<g id="intermediarias"><path fill="{c["meio"]}" d="{_smooth(mid)} L{W} {H} L0 {H} Z"/>'
+               f'<rect y="{H * .7:.0f}" width="{W}" height="{H * .12:.0f}" fill="url(#nevoa)" opacity=".6"/>'
+               '</g><!-- /intermediarias -->')
+    # primeiro plano: colina escura e pinheiros nos cantos (grandes) e embaixo (pequenos)
+    near = [(W * k / 8, H * (.88 - .05 * edge(W * k / 8) - rnd.uniform(0, .02))) for k in range(9)]
+    front = [f'<path fill="{c["perto"]}" d="{_smooth(near)} L{W} {H} L0 {H} Z"/>']
+    pines_far, pines = [], []
+    for side in (0, 1):
+        for _ in range(9):
+            fx = rnd.uniform(0, .2)
+            x = W * (fx if side == 0 else 1 - fx)
+            h = H * (.18 + .3 * (1 - fx / .2)) * rnd.uniform(.75, 1.05)
+            base = H * rnd.uniform(.9, 1.02)
+            (pines if h > H * .3 else pines_far).append((x, base, h))
+    for _ in range(26):
+        x = W * rnd.uniform(.05, .95)
+        pines_far.append((x, H * rnd.uniform(.93, 1.0), H * rnd.uniform(.05, .1)))
+    for group, color in ((pines_far, c["pinheiro_longe"]), (pines, c["pinheiro"])):
+        for x, base, h in sorted(group, key=lambda t: t[1]):
+            front.append(f'<g fill="{color}" data-pinheiro="{x:.0f},{base - h:.0f}">{_pine(x, base, h, h * .42)}</g>')
+    out.append(f'<g id="primeiro-plano">{"".join(front)}</g><!-- /primeiro-plano -->')
+    # destaques: borda de luz no alto dos picos do lado do sol
+    out.append(f'<g id="destaques">{"".join(rims)}</g><!-- /destaques -->')
+    out.append("</svg>\n")
+    return "".join(out)
+
+
+def svg_texture(svg, width, height):
+    """Desenha o SVG de verdade no tamanho da miniatura (a prévia é o próprio papel de parede)."""
+    loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+    loader.set_size(width, height)
+    loader.write(svg.encode())
+    loader.close()
+    return Gdk.Texture.new_for_pixbuf(loader.get_pixbuf())
+
+
 def ensure_wallpapers():
     WALLS.mkdir(parents=True, exist_ok=True)
+    dusk = WALLS / "entardecer.svg"  # a paisagem nas cores originais, pronta na seção Papel de parede
+    if not dusk.exists():
+        dusk.write_text(design_svg(LANDSCAPE_DEFAULT, "entardecer", 0))
     for name, colors in WALL_PALETTES.items():
         f = WALLS / f"{name}.svg"
         if not f.exists():
@@ -1038,10 +1434,14 @@ FAVORITE_COLORS = [("Azul", "#3584e4"), ("Roxo", "#9141ac"), ("Rosa", "#e66197")
 # cores de destaque que o GNOME 47+ aceita em org.gnome.desktop.interface accent-color
 GNOME_ACCENTS = {"blue": "#3584e4", "teal": "#2190a4", "green": "#3a944a", "yellow": "#c88800",
                  "orange": "#ed5b00", "red": "#e62d42", "pink": "#d56199", "purple": "#9141ac", "slate": "#6f8396"}
-# (chave, nome, giro do 2º tom em graus, escura?)
-HARMONIES = [("mono", "Monocromática", 0, True), ("analoga", "Análoga", 35, True),
-             ("complementar", "Complementar", 180, True), ("triade", "Tríade", 120, True),
-             ("clara", "Clara", 35, False)]
+# (chave, nome, explicação com o termo técnico, giro do 2º tom em graus, escura?)
+HARMONIES = [
+    ("mono", "Um tom só", "Monocromática: variações claras e escuras da mesma cor.", 0, True),
+    ("analoga", "Tons vizinhos", "Análoga: a cor e uma vizinha dela no círculo das cores (35°).", 35, True),
+    ("complementar", "Contraste", "Complementar: a cor e a oposta a ela no círculo das cores (180°).", 180, True),
+    ("triade", "Três tons", "Tríade: cores a um terço do círculo uma da outra (120°).", 120, True),
+    ("clara", "Clara", "Análoga com fundo claro.", 35, False),
+]
 PALETTE_START, PALETTE_END = f"/* {APP_NAME}: paleta */", f"/* {APP_NAME}: fim da paleta */"
 
 
@@ -1070,6 +1470,18 @@ def readable_on(bg):
     return max(("#ffffff", "#000000"), key=lambda fg: contrast(fg, bg))
 
 
+def color_name(text):
+    """Nome da cor (das favoritas) mais parecida, para não mostrar só o código."""
+    h, l, sat = hex_hls(text)
+    if sat < .15 or l < .08 or l > .95:
+        return "Cinza" if .08 <= l <= .95 else ("Preto" if l < .08 else "Branco")
+
+    def dist(item):
+        d = abs(hex_hls(item[1])[0] - h)
+        return min(d, 1 - d)
+    return min((c for c in FAVORITE_COLORS if c[0] != "Cinza"), key=dist)[0]
+
+
 def gnome_accent(text):
     """A cor de destaque do GNOME mais parecida (pelo tom; cinza vira 'slate')."""
     h, _l, s = hex_hls(text)
@@ -1088,20 +1500,28 @@ def make_palettes(color):
     grey = s < .12
     sat = 0 if grey else max(s, .55)
     tint = 0 if grey else .22
+    # sem tom (preto, cinza, branco) girar o círculo das cores não muda nada: a claridade da cor
+    # escolhida decide o destaque (preto → prata sobre fundo quase preto; branco → quase branco) e
+    # cada harmonia varia o 2º tom pela claridade, para as paletas não saírem iguais
+    black, white = grey and l < .25, grey and l > .85
+    grey_acc = .8 if black else .9 if white else min(max(l, .5), .64)
+    grey_second = {0: .62, 35: .45, 180: .32, 120: .76}
+    deep = .055 if black else .11
     out = []
-    for key, title, turn, dark in HARMONIES:
+    for key, title, tech, turn, dark in HARMONIES:
         h2 = h + turn / 360
         if dark:
-            accent = hls_hex(h, min(max(l, .5), .64), sat)
-            accent2 = hls_hex(h2, .72 if turn == 0 else .6, sat * (.6 if turn == 0 else 1))
-            bg, base, fg = hls_hex(h, .11, tint), hls_hex(h, .145, tint), hls_hex(h, .93, tint * .5)
-            wall = (hls_hex(h, .13, tint * 1.3), hls_hex(h, .05, tint), accent, accent2)
+            accent = hls_hex(h, grey_acc if grey else min(max(l, .5), .64), sat)
+            accent2 = hls_hex(h, grey_second[turn], 0) if grey else \
+                hls_hex(h2, .72 if turn == 0 else .6, sat * (.6 if turn == 0 else 1))
+            bg, base, fg = hls_hex(h, deep, tint), hls_hex(h, deep + .035, tint), hls_hex(h, .93, tint * .5)
+            wall = (hls_hex(h, deep + .02, tint * 1.3), hls_hex(h, max(deep - .06, .02), tint), accent, accent2)
         else:
-            accent = hls_hex(h, min(max(l, .36), .42), sat)
-            accent2 = hls_hex(h2, .5, sat)
+            accent = hls_hex(h, .15 if black else min(max(l, .36), .42), sat)
+            accent2 = hls_hex(h, .55, 0) if grey else hls_hex(h2, .5, sat)
             bg, base, fg = hls_hex(h, .955, tint * 1.4), hls_hex(h, .99, tint), hls_hex(h, .13, tint)
             wall = (hls_hex(h, .9, tint * 2), hls_hex(h, .76, tint * 2), accent, accent2)
-        out.append(dict(key=key, title=title, dark=dark, accent=accent, accent2=accent2, accent_fg=readable_on(accent),
+        out.append(dict(key=key, title=title, tech=tech, dark=dark, accent=accent, accent2=accent2, accent_fg=readable_on(accent),
                         bg=bg, base=base, fg=fg, wall=wall))
     return out
 
@@ -1155,13 +1575,14 @@ def folder_icon_theme(pal, current):
     """Tema de ícones com as pastas na cor da paleta; o resto vem do tema de ícones atual. Nome novo
     a cada cor (os apps só recarregam os ícones quando o nome muda) e o anterior é apagado."""
     root = USER_DATA / "icons"
+    previous = current
     if current.startswith(FOLDER_PREFIX):  # já é uma pasta colorida: herda do tema de verdade
         index = root / current / "index.theme"
         m = re.search(r"^Inherits=([^,\n]+)", index.read_text(), re.M) if index.exists() else None
         current = m.group(1) if m else "Adwaita"
     name = f"{FOLDER_PREFIX}{pal['accent'][1:]}-{'escuro' if pal['dark'] else 'claro'}"
     for old in root.glob(f"{FOLDER_PREFIX}*"):
-        if old.name != name:
+        if old.name not in (name, previous):  # a anterior fica para o "desfazer"
             shutil.rmtree(old, ignore_errors=True)
     places = root / name / "scalable" / "places"
     places.mkdir(parents=True, exist_ok=True)
@@ -1186,26 +1607,211 @@ def palette_css(pal):
         "headerbar_fg_color": pal["fg"], "sidebar_bg_color": side, "sidebar_fg_color": pal["fg"],
         "popover_bg_color": pal["base"], "popover_fg_color": pal["fg"], "dialog_bg_color": pal["bg"],
         "dialog_fg_color": pal["fg"], "card_fg_color": pal["fg"],
+        # sem estas, cartões e listas caem no fundo padrão (branco) com o texto da paleta (claro)
+        "card_bg_color": hls_hex(h, l + (.06 if pal["dark"] else .03), s) if pal["dark"] else pal["base"],
+        "card_shade_color": "rgba(0, 0, 0, 0.36)" if pal["dark"] else "rgba(0, 0, 0, 0.07)",
+        "headerbar_backdrop_color": pal["bg"],
+        "thumbnail_bg_color": pal["base"], "thumbnail_fg_color": pal["fg"],
     }
     lines = "".join(f"@define-color {k} {v};\n" for k, v in colors.items())
     return f"{PALETTE_START}\n{lines}{PALETTE_END}\n"
 
 
+# ---------------------------------------------------------------- seleção pendente: selecionar → ver → aplicar
+
+# na ordem em que são aplicados: os ícones antes da paleta (as pastas coloridas herdam deles) e o
+# wallpaper depois dela (o que a pessoa escolheu vence o que a paleta gera)
+COMPONENTS = [
+    ("icones", "Ícones", "folder-pictures-symbolic"),
+    ("cores", "Paleta de cores", "applications-graphics-symbolic"),
+    ("tema", "Tema", "preferences-desktop-appearance-symbolic"),
+    ("cursor", "Cursor", "input-mouse-symbolic"),
+    ("wallpaper", "Papel de parede", "preferences-desktop-wallpaper-symbolic"),
+    ("barra", "Barra e dock", "view-continuous-symbolic"),
+    ("efeitos", "Efeitos", "weather-fog-symbolic"),
+]
+COMPONENT_TITLE = {k: t for k, t, _i in COMPONENTS}
+READING_ORDER = ["tema", "cores", "icones", "cursor", "wallpaper", "barra", "efeitos"]  # como a pessoa lê
+# a paleta troca o tema das janelas: escolher uma tira a outra da seleção
+EXCLUSIVE = {"cores": ["tema"], "tema": ["cores"]}
+
+
+class Change:
+    """Uma alteração escolhida e ainda não aplicada."""
+
+    def __init__(self, key, value, label, apply, need=(), source=None):
+        self.key, self.value, self.label, self.apply = key, value, label, apply
+        self.need = list(need)    # itens da Loja que precisam ser baixados antes
+        self.source = source      # (página, cartão) de onde veio, para marcar "Selecionado"
+        self.enabled, self.error = True, None
+
+    @property
+    def title(self):
+        return COMPONENT_TITLE[self.key]
+
+
+class Selection:
+    def __init__(self):
+        self.changes = {}
+
+    def set(self, change):
+        """Põe na seleção; devolve os títulos do que saiu por conflito."""
+        dropped = [COMPONENT_TITLE[k] for k in EXCLUSIVE.get(change.key, []) if self.changes.pop(k, None)]
+        self.changes[change.key] = change
+        return dropped
+
+    def remove(self, key):
+        self.changes.pop(key, None)
+
+    def clear(self):
+        self.changes.clear()
+
+    def toggle(self, key, on):
+        if key in self.changes:
+            self.changes[key].enabled = on
+
+    def ordered(self):
+        return [self.changes[k] for k, _t, _i in COMPONENTS if k in self.changes]
+
+    def enabled(self):
+        return [c for c in self.ordered() if c.enabled]
+
+    def for_reading(self):
+        return sorted(self.changes.values(), key=lambda c: READING_ORDER.index(c.key))
+
+    def selected(self, page):
+        return {c.source[1] for c in self.changes.values() if c.source and c.source[0] == page}
+
+    def needs(self):
+        out = []
+        for c in self.enabled():
+            for item in c.need:
+                if item not in out and not Store.is_installed(item):
+                    out.append(item)
+        return out
+
+    def apply(self):
+        """Aplica o que está marcado, um componente por vez. Um erro não impede os outros.
+        Devolve (títulos aplicados, [(título, motivo)]). O que deu certo sai da seleção; o que
+        falhou fica, com o motivo, para tentar de novo."""
+        import traceback
+        ok, failed = [], []
+        for c in self.enabled():
+            try:
+                c.apply()
+            except Exception as e:  # noqa: BLE001 — qualquer falha vira relatório, não trava o resto
+                traceback.print_exc()
+                c.error = str(e) or type(e).__name__
+                failed.append((c.title, c.error))
+                continue
+            ok.append(c.title)
+            self.changes.pop(c.key, None)
+        return ok, failed
+
+
+class NotInstalled(Exception):
+    pass
+
+
+def human_list(items):
+    items = list(items)
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " e " + items[-1] if items else ""
+
+
+# ---------------------------------------------------------------- meus estilos
+
+def load_styles():
+    try:
+        data = json.loads(MY_STYLES.read_text())
+        return [s for s in data if isinstance(s, dict) and s.get("name")]
+    except (OSError, ValueError):
+        return []
+
+
+def save_style(style):
+    """Guarda (ou substitui, pelo nome) um estilo."""
+    styles = [s for s in load_styles() if s["name"] != style["name"]] + [style]
+    MY_STYLES.parent.mkdir(parents=True, exist_ok=True)
+    MY_STYLES.write_text(json.dumps(styles, indent=1, ensure_ascii=False))
+
+
+def delete_style(name):
+    MY_STYLES.parent.mkdir(parents=True, exist_ok=True)
+    MY_STYLES.write_text(json.dumps([s for s in load_styles() if s["name"] != name], indent=1, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------- o que o ambiente deixa mudar
+
+def environment(desk, user_theme):
+    return dict(user_theme=user_theme, accent=has_key(desk.iface, "accent-color"), bar=desk.bar is not None,
+                bar_name="a barra do Zorin OS" if desk.bar and "zorin" in desk.bar.props.schema_id else "o Dash to Panel",
+                blur=Blur.installed(), lock=desk.lock is not None,
+                animations=desk.iface.get_boolean("enable-animations") if has_key(desk.iface, "enable-animations")
+                else True)
+
+
+def limitations(key, env):
+    """Avisos que aparecem junto do componente afetado. Só o que é verdade neste sistema."""
+    notes = []
+    if key in ("tema", "cores"):
+        if env["user_theme"] == "falta":
+            notes.append("O painel do GNOME não muda: falta a extensão “User Themes” (pacote "
+                         "gnome-shell-extensions). As janelas mudam normalmente.")
+        elif env["user_theme"] == "carregar":
+            notes.append("O painel do GNOME só muda depois que a extensão “User Themes” carregar "
+                         "(confirme a instalação ou saia e entre de novo na sessão).")
+    if key == "tema":
+        notes.append("Apps GTK 3 usam o tema inteiro. Apps GTK 4 (Arquivos, Configurações…) recebem as cores "
+                      "e parte dos detalhes. Apps Flatpak, Qt, Electron e navegadores podem não mudar.")
+        notes.append("Apps abertos podem precisar ser reabertos.")
+    if key == "cores":
+        notes.append("Troca o tema das janelas pelo Adwaita com estas cores, pinta as pastas e gera um papel "
+                     "de parede (a menos que você escolha outro).")
+        if not env["accent"]:
+            notes.append("Este GNOME não tem cor de destaque do sistema (só a partir do GNOME 47): "
+                         "a cor vale para os apps, não para o painel.")
+    if key == "icones":
+        notes.append("Apps Flatpak e apps com ícone próprio podem continuar com o ícone de antes.")
+    if key == "cursor":
+        notes.append("Alguns apps só trocam o cursor quando são reabertos.")
+    if key == "wallpaper" and env["lock"]:
+        notes.append("Vale para a área de trabalho e para a tela de bloqueio.")
+    if key == "barra":
+        notes.append(f"Ajusta {env['bar_name']} em todos os monitores conectados.")
+    if key == "efeitos":
+        notes.append("Usa a extensão Blur my Shell. O vidro nas janelas depende do app e pesa na placa de vídeo.")
+    return notes
+
+
 # ---------------------------------------------------------------- interface
 
+# A estrutura do app usa só as cores nomeadas da libadwaita: fica neutra, com bordas discretas,
+# e não muda enquanto a pessoa só está vendo prévias (nada é aplicado antes do "Aplicar").
 CSS = """
-.studio-card { padding: 10px; border-radius: 16px; }
-.studio-card.atual { box-shadow: inset 0 0 0 3px @accent_bg_color; }
+.studio-card { padding: 8px; border-radius: 12px; }
+.studio-card.selecionado { box-shadow: inset 0 0 0 2px @accent_bg_color; }
+.studio-card:focus-visible { outline: 2px solid @accent_color; outline-offset: 2px; }
 .studio-card .titulo { font-weight: 700; }
-.studio-card .sub { font-size: 0.85em; opacity: 0.65; }
-.studio-thumb { border-radius: 10px; }
+.studio-card .sub { font-size: 0.85em; opacity: 0.75; }
+.studio-thumb { border-radius: 8px; }
+.studio-badge { font-size: 0.8em; font-weight: 700; padding: 1px 8px; border-radius: 99px;
+                background: alpha(@window_fg_color, 0.1); }
+.studio-badge.em-uso { background: alpha(@success_color, 0.18); }
+.studio-badge.selecionado { background: @accent_bg_color; color: @accent_fg_color; }
+.studio-badge.erro { background: alpha(@error_color, 0.18); }
+.studio-check { background: @accent_bg_color; color: @accent_fg_color; border-radius: 99px; padding: 3px; }
 .studio-pill { font-size: 0.85em; font-weight: 700; padding: 2px 10px; border-radius: 99px;
-               background: alpha(@accent_bg_color, 0.2); color: @accent_color; }
-.studio-pill.ok { background: alpha(@success_color, 0.2); color: @success_color; }
-.studio-notice { padding: 10px 16px; margin: 12px 18px 0 18px; }
-.studio-veil { background: alpha(@window_bg_color, 0.6); border-radius: 12px; }
+               background: alpha(@window_fg_color, 0.1); }
+.studio-pill.ok { background: alpha(@success_color, 0.18); }
+.studio-pill.erro { background: alpha(@error_color, 0.18); }
+.studio-notice { padding: 10px 16px; margin: 12px 24px 0 24px; }
+.studio-note { padding: 8px 10px; border-radius: 8px; background: alpha(@window_fg_color, 0.05); }
+.studio-note.erro { background: alpha(@error_color, 0.12); }
+.studio-veil { background: alpha(@window_bg_color, 0.7); border-radius: 12px; }
 .studio-done { color: @success_color; background: alpha(@success_color, 0.18); border-radius: 99px;
                padding: 10px; }
+.studio-dock { background: alpha(black, 0.45); border-radius: 8px; padding: 3px 6px; }
+.studio-swatch { border-radius: 99px; }
 """
 
 # Atalhos que funcionam também na libadwaita 1.1 / GTK 4.6 (Ubuntu 22.04, Zorin 17, Pop!_OS 22.04)
@@ -1219,34 +1825,67 @@ def switch_row(title, subtitle=None):
     return row, sw
 
 
-def spin_row(title, lo, hi, subtitle=None):
+def spin_row(title, lo, hi, subtitle=None, unit=None, step=1):
     row = Adw.ActionRow(title=title, subtitle=subtitle or "")
-    spin = Gtk.SpinButton.new_with_range(lo, hi, 1)
+    spin = Gtk.SpinButton.new_with_range(lo, hi, step)
     spin.set_valign(Gtk.Align.CENTER)
     row.add_suffix(spin)
+    if unit:
+        row.add_suffix(Gtk.Label(label=unit, css_classes=["dim-label"]))
+    set_label(spin, title)
     return row, spin
 
 
-def picture(**kw):
+def scale_row(title, lo, hi, subtitle=None, unit="%"):
+    """Controle deslizante com o valor escrito ao lado (não só a posição da bolinha)."""
+    row = Adw.ActionRow(title=title, subtitle=subtitle or "")
+    scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, 1)
+    scale.set_size_request(200, -1)
+    scale.set_valign(Gtk.Align.CENTER)
+    value = Gtk.Label(width_chars=5, xalign=1)
+    scale.connect("value-changed", lambda s: value.set_label(f"{s.get_value():.0f} {unit}"))
+    row.add_suffix(scale)
+    row.add_suffix(value)
+    set_label(scale, title)
+    scale.row = row
+    return row, scale
+
+
+def set_label(widget, text):
+    """Nome acessível (leitor de tela). PyGObject antigo pode não ter o atalho: aí fica o tooltip."""
+    try:
+        widget.update_property([Gtk.AccessibleProperty.LABEL], [text])
+    except (TypeError, AttributeError, ValueError):
+        widget.set_tooltip_text(text)
+
+
+def picture(fit="cover", **kw):
     pic = Gtk.Picture(**kw)
     if hasattr(Gtk, "ContentFit"):
-        pic.set_content_fit(Gtk.ContentFit.COVER)
+        pic.set_content_fit(Gtk.ContentFit.COVER if fit == "cover" else Gtk.ContentFit.CONTAIN)
     else:
-        pic.set_keep_aspect_ratio(False)
+        pic.set_keep_aspect_ratio(fit != "cover")
     return pic
+
+
+def animations_enabled():
+    """Preferência de movimento reduzido: GNOME → Acessibilidade → Animações."""
+    s = Gtk.Settings.get_default()
+    return s is None or s.props.gtk_enable_animations
 
 
 class Spinner(Gtk.DrawingArea):
     """Arco girando na cor de destaque. O Gtk.Spinner usa o ícone do tema de ícones ativo e muda
-    de cara (ou some) a cada tema; este fica igual em qualquer um."""
+    de cara (ou some) a cada tema; este fica igual em qualquer um. Com as animações do sistema
+    desligadas, fica parado."""
 
-    def __init__(self, size=40):
+    def __init__(self, size=40, color=None):
         super().__init__(content_width=size, content_height=size)
-        self._angle, self._tick = 0.0, None
+        self._angle, self._tick, self._color = 0.0, None, color
         self.set_draw_func(self._draw)
 
     def start(self):
-        if self._tick is None:
+        if self._tick is None and animations_enabled():
             self._tick = self.add_tick_callback(self._step)
 
     def stop(self):
@@ -1260,13 +1899,15 @@ class Spinner(Gtk.DrawingArea):
         return True
 
     def _draw(self, _a, cr, w, h):
-        ok, acc = False, None
+        ok, acc = bool(self._color), self._color
         try:
-            ok, acc = self.get_style_context().lookup_color("accent_bg_color")
+            if not ok:
+                ok, acc = self.get_style_context().lookup_color("accent_bg_color")
         except (AttributeError, TypeError):
             pass
-        acc = acc if ok else rgba("#cba6f7")
-        r, lw = min(w, h) / 2 - 3, 4
+        acc = acc if ok else rgba("#3584e4")
+        lw = max(2, min(w, h) / 10)
+        r = min(w, h) / 2 - lw
         _src(cr, acc, .22)
         cr.set_line_width(lw)
         cr.arc(w / 2, h / 2, r, 0, 2 * pi)
@@ -1284,72 +1925,216 @@ def thumb_texture(path, width, height):
     return Gdk.Texture.new_for_pixbuf(pb)
 
 
-def confirm(parent, heading, body, action, on_yes):
+def load_async(pic, path, width, height):
+    """Carrega a miniatura fora da tela principal para a janela não travar."""
+    def work():
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), width, height, True)
+        except GLib.Error:
+            return
+        GLib.idle_add(lambda: pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb)) or False)
+    POOL.submit(work)
+
+
+def _dialog(parent, heading, body, responses, on_response, extra=None):
     if hasattr(Adw, "MessageDialog"):
         dlg = Adw.MessageDialog(transient_for=parent, heading=heading, body=body)
-        dlg.add_response("cancel", "Cancelar")
-        dlg.add_response("ok", action)
-        dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
-        dlg.connect("response", lambda _d, r: r == "ok" and on_yes())
+        for rid, label, style in responses:
+            dlg.add_response(rid, label)
+            if style:
+                dlg.set_response_appearance(rid, style)
+        dlg.set_default_response(responses[-1][0])
+        dlg.set_close_response(responses[0][0])
+        if extra:
+            dlg.set_extra_child(extra)
+        dlg.connect("response", lambda _d, r: on_response(r))
     else:
-        dlg = Gtk.MessageDialog(transient_for=parent, modal=True, buttons=Gtk.ButtonsType.OK_CANCEL,
-                                text=heading, secondary_text=body)
-        dlg.connect("response", lambda d, r: (d.destroy(), r == Gtk.ResponseType.OK and on_yes()))
+        buttons = Gtk.ButtonsType.OK if len(responses) == 1 else Gtk.ButtonsType.OK_CANCEL
+        dlg = Gtk.MessageDialog(transient_for=parent, modal=True, buttons=buttons, text=heading, secondary_text=body)
+        if extra:
+            dlg.get_message_area().append(extra)
+        last = responses[-1][0]
+        dlg.connect("response", lambda d, r: (d.destroy(), on_response(last if r == Gtk.ResponseType.OK
+                                                                        else responses[0][0])))
     dlg.present()
+    return dlg
+
+
+def _appearance(name):
+    """Adw.ResponseAppearance só existe a partir da libadwaita 1.2 (junto com o MessageDialog)."""
+    kind = getattr(Adw, "ResponseAppearance", None)
+    return getattr(kind, name) if kind else None
+
+
+def confirm(parent, heading, body, action, on_yes, destructive=False):
+    style = _appearance("DESTRUCTIVE" if destructive else "SUGGESTED")
+    return _dialog(parent, heading, body, [("cancel", "Cancelar", None), ("ok", action, style)],
+                   lambda r: r == "ok" and on_yes())
+
+
+def inform(parent, heading, body):
+    return _dialog(parent, heading, body, [("ok", "Entendi", None)], lambda r: None)
+
+
+def ask_text(parent, heading, body, action, initial, on_ok):
+    entry = Gtk.Entry(text=initial, activates_default=True, hexpand=True)
+    set_label(entry, heading)
+    return _dialog(parent, heading, body, [("cancel", "Cancelar", None),
+                                           ("ok", action, _appearance("SUGGESTED"))],
+                   lambda r: r == "ok" and entry.get_text().strip() and on_ok(entry.get_text().strip()), entry)
 
 
 def mb(n):
     return f"{n / 1e6:.0f} MB" if n >= 1e6 else f"{n / 1e3:.0f} KB"
 
 
-class Grid(Gtk.Box):
-    """Grade de cartões clicáveis com busca."""
+def dots(colors, size=12):
+    """Bolinhas com as cores principais (complemento visual; o nome vem escrito no subtítulo)."""
+    box = Gtk.Box(spacing=3, valign=Gtk.Align.CENTER)
+    for c in colors:
+        box.append(drawing(size, size, lambda cr, w, h, c=rgba(c) if isinstance(c, str) else c: (
+            _src(cr, c), cr.arc(w / 2, h / 2, w / 2 - .5, 0, 2 * pi), cr.fill_preserve(),
+            _src(cr, rgba("#808080"), .5), cr.set_line_width(1), cr.stroke())))
+    return box
 
-    def __init__(self, on_pick, extra=None, search=True, scroll=True):
+
+def status_page(icon, title, description=None, button=None, on_click=None):
+    page = Adw.StatusPage(icon_name=icon, title=title, description=description or "", vexpand=True)
+    if button:
+        btn = Gtk.Button(label=button, halign=Gtk.Align.CENTER, css_classes=["pill", "suggested-action"])
+        btn.connect("clicked", lambda _b: on_click())
+        page.set_child(btn)
+    return page
+
+
+class Grid(Gtk.Box):
+    """Catálogo de cartões com busca, filtros e os estados vazio, carregando e sem resultados.
+    Cada cartão separa: passar o mouse (realce do botão), foco do teclado (contorno), selecionado
+    (borda + ✓ + texto) e em uso (etiqueta “Em uso”)."""
+
+    def __init__(self, on_pick, extra=None, search=True, scroll=True, filters=None, placeholder="Buscar…",
+                 empty=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.on_pick, self.cards, self.query, self.kind, self.working = on_pick, {}, "", None, None
-        bar = Gtk.Box(spacing=8, margin_start=18, margin_end=18, margin_top=12)
+        self.tag, self.loading, self.in_use, self.picked = None, False, None, set()
+        margin = 24 if scroll else 0
+        bar = Gtk.Box(spacing=8, margin_start=margin, margin_end=margin, margin_top=12)
+        self.search = None
         if search:
-            entry = Gtk.SearchEntry(placeholder_text="Buscar…", hexpand=True)
-            entry.connect("search-changed", self._search)
-            bar.append(entry)
+            self.search = Gtk.SearchEntry(placeholder_text=placeholder, hexpand=True)
+            set_label(self.search, placeholder.rstrip("…"))
+            self.search.connect("search-changed", self._search)
+            bar.append(self.search)
         if extra:
             bar.append(extra)
         if search or extra:
             self.append(bar)
+        if filters:
+            fbox = Gtk.Box(spacing=6, margin_start=margin, margin_end=margin, margin_top=10)
+            first = None
+            for label, tag in filters:
+                b = Gtk.ToggleButton(label=label, active=first is None, css_classes=["pill"])
+                if first:
+                    b.set_group(first)
+                first = first or b
+                b.connect("toggled", lambda b, t=tag: b.get_active() and self.filter_tag(t))
+                fbox.append(b)
+            self.append(fbox)
         self.flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, valign=Gtk.Align.START,
                                 max_children_per_line=6, min_children_per_line=1, row_spacing=14,
-                                column_spacing=14, margin_start=18, margin_end=18, margin_top=12, margin_bottom=18)
+                                column_spacing=14, margin_start=margin, margin_end=margin, margin_top=12,
+                                margin_bottom=18)
         self.flow.set_filter_func(self._visible)
-        if scroll:
-            self.append(Gtk.ScrolledWindow(child=self.flow, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
-        else:  # dentro de uma página que já rola (Adw.PreferencesPage)
-            self.flow.set_margin_start(0)
-            self.flow.set_margin_end(0)
-            self.append(self.flow)
+        # setas do teclado param no espaço do cartão; Enter ali aciona o cartão
+        self.flow.connect("child-activated", lambda _f, child: self._btn(child).emit("clicked"))
+        self.status = Gtk.Stack(vexpand=scroll)
+        self.status.add_named(Gtk.ScrolledWindow(child=self.flow, vexpand=True,
+                                                 hscrollbar_policy=Gtk.PolicyType.NEVER) if scroll else self.flow,
+                              "lista")
+        self.status.add_named(status_page("edit-find-symbolic", "Nenhum resultado",
+                                          "Tente outra palavra ou outro filtro."), "sem-resultados")
+        load = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, halign=Gtk.Align.CENTER,
+                       valign=Gtk.Align.CENTER, vexpand=True)
+        self._spinner = Spinner(32)
+        load.append(self._spinner)
+        load.append(Gtk.Label(label="Carregando…", css_classes=["dim-label"]))
+        self.status.add_named(load, "carregando")
+        self.status.add_named(empty or status_page("folder-symbolic", "Nada por aqui"), "vazio")
+        self.append(self.status)
+
+    @staticmethod
+    def _btn(child):
+        w = child.get_child()
+        return getattr(w, "btn", w)
 
     def _visible(self, child):
-        btn = child.get_child()
-        return self.query in btn.search_text and (self.kind is None or btn.kind == self.kind)
+        btn = self._btn(child)
+        return self.query in btn.search_text and (self.kind is None or btn.kind == self.kind) and \
+            (self.tag is None or self.tag in btn.tags)
+
+    def _update_status(self):
+        if not self.cards:
+            name = "carregando" if self.loading else "vazio"
+        elif any(self._visible(c.get_parent()) for c in self._cells()):
+            name = "lista"
+        else:
+            name = "carregando" if self.loading else "sem-resultados"
+        self.status.set_visible_child_name(name)
+        (self._spinner.start if name == "carregando" else self._spinner.stop)()
+
+    def _cells(self):
+        child = self.flow.get_first_child()
+        while child:
+            yield child.get_child()
+            child = child.get_next_sibling()
 
     def _search(self, entry):
         self.query = entry.get_text().lower()
         self.flow.invalidate_filter()
+        self._update_status()
+
+    def set_query(self, text):
+        if self.search:
+            self.search.set_text(text)
+            self._search(self.search)  # o "search-changed" chega com atraso
 
     def filter_kind(self, kind):
         self.kind = kind
         self.flow.invalidate_filter()
+        self._update_status()
 
-    def add(self, key, preview, title, subtitle=None, extra=None, kind=None):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    def filter_tag(self, tag):
+        self.tag = tag
+        self.flow.invalidate_filter()
+        self._update_status()
+
+    def set_loading(self, on):
+        self.loading = on
+        self._update_status()
+
+    def add(self, key, preview, title, subtitle=None, extra=None, kind=None, tags=(), colors=None, below=None):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.append(preview)
+        head = Gtk.Box(spacing=6)
         # max_width_chars segura a largura natural: nomes compridos não esticam a grade inteira
-        box.append(Gtk.Label(label=title, xalign=0, ellipsize=3, max_width_chars=20, css_classes=["titulo"]))
-        if subtitle:
-            box.append(Gtk.Label(label=subtitle, xalign=0, ellipsize=3, max_width_chars=24, css_classes=["sub"]))
+        head.append(Gtk.Label(label=title, xalign=0, ellipsize=3, max_width_chars=18, hexpand=True,
+                              css_classes=["titulo"]))
+        badge = Gtk.Label(label="Em uso", css_classes=["studio-badge", "em-uso"], visible=False,
+                          valign=Gtk.Align.CENTER)
+        head.append(badge)
+        box.append(head)
+        if subtitle or colors:
+            row = Gtk.Box(spacing=6)
+            row.append(Gtk.Label(label=subtitle or "", xalign=0, ellipsize=3, max_width_chars=22, hexpand=True,
+                                 css_classes=["sub"]))
+            if colors:
+                row.append(dots(colors))
+            box.append(row)
         if extra:
             box.append(extra)
-        # véu do "carregando": círculo girando enquanto aplica, ✓ quando termina
+        check = Gtk.Image(icon_name="object-select-symbolic", css_classes=["studio-check"], visible=False,
+                          halign=Gtk.Align.END, valign=Gtk.Align.START, margin_top=6, margin_end=6)
+        # véu do "carregando": círculo girando enquanto trabalha, ✓ quando termina
         stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, halign=Gtk.Align.CENTER,
                           valign=Gtk.Align.CENTER, hexpand=True, vexpand=True)
         stack.add_named(Spinner(40), "load")
@@ -1358,14 +2143,31 @@ class Grid(Gtk.Box):
         veil = Gtk.Box(css_classes=["studio-veil"], visible=False)
         veil.append(stack)
         overlay = Gtk.Overlay(child=box)
+        overlay.add_overlay(check)
         overlay.add_overlay(veil)
-        btn = Gtk.Button(child=overlay, css_classes=["card", "studio-card"], tooltip_text=title)
-        btn.search_text, btn.kind = f"{title} {subtitle or ''}".lower(), kind
-        btn.veil, btn.veil_stack = veil, stack
+        btn = Gtk.Button(child=overlay, css_classes=["card", "studio-card"])
+        btn.title, btn.search_text, btn.kind, btn.tags = title, f"{title} {subtitle or ''}".lower(), kind, set(tags)
+        btn.veil, btn.veil_stack, btn.badge, btn.check = veil, stack, badge, check
         btn.connect("clicked", lambda _b: self.working is None and self.on_pick(key))
-        self.flow.append(btn)
+        cell = btn
+        if below:
+            cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            cell.append(btn)
+            cell.append(below)
+            cell.btn = btn
+        self.flow.append(cell)
         self.cards[key] = btn
+        self._describe(key)
+        if self.status.get_visible_child_name() != "lista" and self._visible(cell.get_parent()):
+            self._update_status()
         return btn
+
+    def _describe(self, key):
+        btn = self.cards[key]
+        states = (["selecionado"] if key in self.picked else []) + (["em uso"] if key == self.in_use else [])
+        text = ", ".join([btn.title] + states)
+        btn.set_tooltip_text(text)
+        set_label(btn, text)
 
     def start(self, key):
         """Cartão em 'carregando'; cliques na grade ficam bloqueados até finish()."""
@@ -1393,10 +2195,23 @@ class Grid(Gtk.Box):
         while child := self.flow.get_first_child():
             self.flow.remove(child)
         self.cards, self.working = {}, None
+        self._update_status()
 
     def mark(self, key):
+        """Etiqueta “Em uso” no cartão do que está aplicado no sistema."""
+        self.in_use = key
         for k, btn in self.cards.items():
-            (btn.add_css_class if k == key else btn.remove_css_class)("atual")
+            btn.badge.set_visible(k == key)
+            self._describe(k)
+
+    def select(self, keys):
+        """Borda e ✓ nos cartões escolhidos e ainda não aplicados."""
+        self.picked = set(keys)
+        for k, btn in self.cards.items():
+            on = k in self.picked
+            (btn.add_css_class if on else btn.remove_css_class)("selecionado")
+            btn.check.set_visible(on)
+            self._describe(k)
 
 
 def pretty(name):
@@ -1419,104 +2234,756 @@ def add_batched(items, fn, done=None):
     GLib.idle_add(step)
 
 
+# ---------------------------------------------------------------- prévias de área de trabalho
+
+DOCK_APPS = [["web-browser", "firefox", "google-chrome"], ["system-file-manager", "org.gnome.Nautilus", "folder"],
+             ["utilities-terminal", "org.gnome.Terminal", "terminal"],
+             ["accessories-text-editor", "org.gnome.TextEditor", "text-editor"],
+             ["org.gnome.Settings", "preferences-system", "gnome-control-center"]]
+
+
+def desktop_preview(wall, pal, icons, width, height, fallback=WALL_PALETTES["graphite"]):
+    """Ilustração de uma área de trabalho: o papel de parede de verdade, uma janela com as cores
+    do tema, a barra do topo e um dock com os ícones do tema (quando ele está instalado)."""
+    if wall and Path(wall).exists():
+        base = picture(width_request=width, height_request=height, css_classes=["studio-thumb"],
+                       overflow=Gtk.Overflow.HIDDEN, can_shrink=True)
+        load_async(base, wall, width, height)
+    else:
+        base = drawing(width, height, lambda cr, w, h: draw_backdrop(cr, w, h, fallback))
+
+    def paint(cr, w, h):
+        _rr(cr, 0, 0, w, h, 8)
+        cr.clip()
+        _src(cr, rgba("#000000"), .6)
+        cr.rectangle(0, 0, w, max(5, h * .06))
+        cr.fill()
+        ww = w * .66
+        s = ww / 300
+        cr.save()
+        cr.translate(w * .17, h * .14)
+        cr.scale(s, s)
+        draw_window(cr, 0, 0, 300, h * .6 / s, pal)
+        cr.restore()
+    overlay = Gtk.Overlay(child=base, halign=Gtk.Align.CENTER)
+    overlay.add_overlay(drawing(width, height, paint))
+    size = max(12, round(height * .1))
+    dock = Gtk.Box(spacing=max(2, size // 4), halign=Gtk.Align.CENTER, valign=Gtk.Align.END,
+                   margin_bottom=max(3, round(height * .04)), css_classes=["studio-dock"])
+    if icons:
+        for paint_ in icon_paintables(icons, size, DOCK_APPS):
+            dock.append(Gtk.Image(paintable=paint_, pixel_size=size))
+    else:  # tema de ícones ainda não baixado: não finge mostrar os ícones dele
+        for c in (pal[3], pal[2], pal[3], pal[2]):
+            dock.append(drawing(size, size, lambda cr, w, h, c=c: (_src(cr, c, .8), _rr(cr, 1, 1, w - 2, h - 2, 3),
+                                                                    cr.fill())))
+    overlay.add_overlay(dock)
+    return overlay
+
+
+def window_preview(pal, width, height):
+    """Janela com as cores do tema desenhada em escala (mesma proporção em qualquer tamanho)."""
+    def paint(cr, w, h):
+        s = (w - 12) / 300
+        cr.save()
+        cr.translate(6, 6)
+        cr.scale(s, s)
+        draw_window(cr, 0, 0, 300, (h - 14) / s, pal)
+        cr.restore()
+    return drawing(width, height, paint)
+
+
+def draw_bar(cr, w, h, p):
+    """Ilustração da barra: posição, comprimento, margem, arredondamento e transparência."""
+    draw_backdrop(cr, w, h, WALL_PALETTES["graphite"])
+    m = p.get("margin", 0) * .9
+    thick = max(10, p.get("size", 48) / 3)
+    pos = p.get("position", "BOTTOM")
+    vertical = pos in ("LEFT", "RIGHT")
+    span = (h if vertical else w)
+    length = span * .5 if p.get("length", 100) == -1 else span - 2 * m
+    if vertical:
+        bw, bh = thick, length
+        x = m if pos == "LEFT" else w - thick - m
+        y = (h - bh) / 2
+    else:
+        bw, bh = length, thick
+        x = (w - bw) / 2
+        y = m if pos == "TOP" else h - thick - m
+    _src(cr, rgba("#1e1e1e"), p.get("opacity", 1) if p.get("custom") else 1)
+    _rr(cr, x, y, bw, bh, min(p.get("radius", 0) * 3, thick / 2) or .1)
+    cr.fill()
+    colors = ["#62a0ea", "#57e389", "#f8e45c", "#ffa348", "#dc8add"]
+    for i, c in enumerate(colors):
+        _src(cr, rgba(c))
+        off = (i - 2) * thick * .9
+        cx, cy = (x + bw / 2, h / 2 + off) if vertical else (w / 2 + off, y + bh / 2)
+        cr.arc(cx, cy, thick * .28, 0, 2 * pi)
+        cr.fill()
+
+
+def draw_glass(cr, w, h, p):
+    draw_backdrop(cr, w, h, WALL_PALETTES["neon"])
+    glass = bool(p["parts"])
+    strength = p["radius"] / 50 if glass else 0
+    x, y, gw, gh = w * .14, h * .18, w * .72, h * .64
+    _src(cr, rgba("#ffffff") if glass else rgba("#1e1e2e"), .10 + .12 * strength if glass else 1)
+    _rr(cr, x, y, gw, gh, 12)
+    cr.fill_preserve()
+    _src(cr, rgba("#ffffff"), .35 if glass else .08)
+    cr.set_line_width(1.2)
+    cr.stroke()
+    for i, frac in enumerate((.6, .4, .5)):
+        _src(cr, rgba("#ffffff"), .75 if i == 0 else .4)
+        _rr(cr, x + 14, y + 16 + i * 14, (gw - 28) * frac, 7, 3.5)
+        cr.fill()
+
+
+BAR_PRESETS = {
+    "Dock flutuante": dict(length=-1, margin=8, radius=3, size=52, custom=True, opacity=.85),
+    "Barra flutuante": dict(length=100, margin=8, radius=3, size=48, custom=True, opacity=.85),
+    "Barra clássica": dict(length=100, margin=0, radius=0, size=47, custom=False, opacity=.85),
+}
+BAR_POSITIONS = [("BOTTOM", "Embaixo"), ("TOP", "Em cima"), ("LEFT", "À esquerda"), ("RIGHT", "À direita")]
+ILLUSTRATIVE = "Ilustração: mostra as cores e a composição, não é uma captura do seu sistema."
+
+
+def same(a, b):
+    return all(a.get(k) == v for k, v in b.items())
+
+
+class Curtain:
+    """Cobre todas as telas com a cor do fundo do visual novo, o logo e um carregando, enquanto o
+    sistema troca de tema (o GNOME Shell e os apps dão uma travada ao recarregar o tema)."""
+
+    FADE_MS = 220
+
+    def __init__(self, parent):
+        self.parent, self.windows = parent, []
+
+    def cover(self, bg, then, accent=None):
+        self.uncover()
+        monitors = self.parent.get_display().get_monitors()
+        for i in range(monitors.get_n_items()):
+            win = Gtk.Window(decorated=False, transient_for=self.parent, title=APP_NAME)
+            overlay, spin = self.content(bg, accent)
+            win.set_child(overlay)
+            set_label(win, "Aplicando o novo visual")
+            win.fullscreen_on_monitor(monitors.get_item(i))
+            win.present()
+            spin.start()
+            self.windows.append(win)
+        # deixa a cortina aparecer na tela antes do trabalho pesado começar
+        GLib.timeout_add(self.FADE_MS + 80, lambda: then() and False)
+
+    @staticmethod
+    def content(bg, accent=None):
+        """Fundo sólido na cor do visual novo, logo, carregando e o texto em preto ou branco,
+        o que der mais contraste com esse fundo (tema claro → cortina clara com texto escuro)."""
+        color = rgba(bg) or rgba("#242424")
+        ink = readable_on(color.to_string())
+        back = drawing(10, 10, lambda cr, w, h, c=color: (_src(cr, c), cr.paint()))
+        back.set_hexpand(True)
+        back.set_vexpand(True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24, halign=Gtk.Align.CENTER,
+                      valign=Gtk.Align.CENTER)
+        box.append(Gtk.Image(icon_name=APP_ID, pixel_size=128))
+        spin = Spinner(44, rgba(accent) if accent else None)  # na cor de destaque do visual novo
+        spin.set_halign(Gtk.Align.CENTER)
+        box.append(spin)
+        text = Gtk.Label()
+        text.set_markup(f'<span foreground="{ink}" size="large">Aplicando o novo visual…</span>')
+        box.append(text)
+        overlay = Gtk.Overlay(child=back)
+        overlay.add_overlay(box)
+        return overlay, spin
+
+    def uncover(self):
+        wins, self.windows = self.windows, []
+        if not wins:
+            return
+        if not animations_enabled():
+            for w in wins:
+                w.destroy()
+            return
+        steps = [0]
+
+        def fade():
+            steps[0] += 1
+            for w in wins:
+                w.set_opacity(max(0, 1 - steps[0] / 10))
+            if steps[0] >= 10:
+                for w in wins:
+                    w.destroy()
+                return False
+            return True
+        GLib.timeout_add(self.FADE_MS // 10, fade)
+
+
 class Window(Adw.ApplicationWindow):
+    # nome, título, grupo, ícone, descrição
     PAGES = [
-        ("combos", "Combos", "view-grid-symbolic", "_build_combos"),
-        ("cores", "Cores", "applications-graphics-symbolic", "_build_colors"),
-        ("temas", "Temas", "preferences-desktop-appearance-symbolic", "_build_themes"),
-        ("icones", "Ícones", "folder-pictures-symbolic", "_build_icons"),
-        ("cursores", "Cursores", "input-mouse-symbolic", "_build_cursors"),
-        ("wallpaper", "Wallpaper", "preferences-desktop-wallpaper-symbolic", "_build_walls"),
-        ("barra", "Barra", "view-continuous-symbolic", "_build_bar"),
-        ("efeitos", "Efeitos", "weather-fog-symbolic", "_build_effects"),
-        ("loja", "Loja", "system-software-install-symbolic", "_build_store"),
+        ("estilos", "Estilos prontos", "Visual", "view-grid-symbolic",
+         "Um visual completo: tema, ícones, cursor e papel de parede."),
+        ("cores", "Cores", "Visual", "applications-graphics-symbolic",
+         "Escolha uma cor e veja paletas que combinam com ela."),
+        ("temas", "Temas", "Visual", "preferences-desktop-appearance-symbolic",
+         "Como ficam as janelas, os botões e os menus."),
+        ("icones", "Ícones", "Visual", "folder-pictures-symbolic", "Os ícones de pastas e aplicativos."),
+        ("cursores", "Cursores", "Visual", "input-mouse-symbolic", "O ponteiro do mouse."),
+        ("wallpaper", "Papel de parede", "Visual", "preferences-desktop-wallpaper-symbolic",
+         "A imagem da área de trabalho e da tela de bloqueio."),
+        ("barra", "Barra e dock", "Desktop", "view-continuous-symbolic",
+         "Posição, tamanho e formato da barra de tarefas."),
+        ("efeitos", "Efeitos", "Desktop", "weather-fog-symbolic", "Vidro fosco em menus, painéis e janelas."),
+        ("explorar", "Explorar", "Biblioteca", "system-software-install-symbolic",
+         "Baixe temas, ícones e cursores. Instalar não muda o seu visual: depois você escolhe e aplica."),
+        ("meus", "Meus estilos", "Biblioteca", "user-bookmarks-symbolic",
+         "Visuais que você salvou para usar de novo."),
     ]
-    KIND_PAGE = {"gtk": "Temas", "icons": "Ícones", "cursors": "Cursores"}
+    PAGE = {p[0]: p for p in PAGES}
+    KIND_PAGE = {"gtk": "temas", "icons": "icones", "cursors": "cursores"}
+    WIDE, NARROW = 1080, 760   # três colunas / detalhes em página própria / lateral recolhida
+    MIN_LOAD_MS = 600          # o sistema leva um instante para redesenhar; abaixo disso só pisca
+    SETTLE_MS = 1200           # com a cortina: tempo para o Shell e os apps terminarem de trocar
+    HEAVY = {"tema", "cores", "icones", "cursor"}  # trocas que fazem o sistema dar uma travada
 
     def __init__(self, app):
-        super().__init__(application=app, title=APP_NAME, default_width=1180, default_height=800)
+        super().__init__(application=app, title=APP_NAME, default_width=1240, default_height=820)
+        self.set_size_request(360, 480)
         self.desk = Desktop()
         self.desk.ensure_backup()
         self.desk.link_cursor_themes()
         self.user_theme = self.desk.ensure_user_theme()
         ensure_wallpapers()
         self.store = Store()
-        self.busy = False
+        self.store_loading = True
+        self.sel = Selection()
+        self.busy = self.applying = False
+        self.mode, self.detail_for, self._nav_sync = None, None, False
+        self.theme_css = None
+        self.curtain = Curtain(self)
+        self.grids, self.builders = {}, {}
         self._scan()
+        self._actions()
 
-        self.toasts = Adw.ToastOverlay()
-        self.stack = Adw.ViewStack(vexpand=True)
-        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        # --- lateral
+        # margens nos próprios widgets: alguns temas GTK zeram o espaçamento do .navigation-sidebar
+        self.nav = Gtk.ListBox(css_classes=["navigation-sidebar"], margin_start=6, margin_end=6, margin_top=4)
+        self.nav.set_header_func(self._nav_header)
+        self.rows = {}
+        for name, title, group, icon, _d in self.PAGES:
+            box = Gtk.Box(spacing=12, margin_start=8, margin_end=8, margin_top=6, margin_bottom=6)
+            box.append(Gtk.Image(icon_name=icon))
+            box.append(Gtk.Label(label=title, xalign=0, hexpand=True))
+            row = Gtk.ListBoxRow(child=box)
+            row.page, row.group = name, group
+            self.nav.append(row)
+            self.rows[name] = row
+        self.nav.connect("row-selected", self._nav_selected)
+        footer = self.footer = Gtk.Box(spacing=10, margin_start=14, margin_end=14, margin_top=10, margin_bottom=10)
+        footer.append(Gtk.Image(icon_name="video-display-symbolic", valign=Gtk.Align.CENTER))
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+        info.append(Gtk.Label(label="Visual atual", xalign=0, css_classes=["caption", "dim-label"]))
+        self.current_label = Gtk.Label(xalign=0, ellipsize=3, max_width_chars=18, css_classes=["heading"])
+        info.append(self.current_label)
+        footer.append(info)
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, width_request=220)
+        side.append(Gtk.ScrolledWindow(child=self.nav, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
+        side.append(Gtk.Separator())
+        side.append(footer)
+        self.sidebar = Gtk.Box()
+        self.sidebar.append(side)
+        self.sidebar_sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        self.sidebar.append(self.sidebar_sep)
+        self.side = side
+
+        # --- centro: catálogo das páginas + painel de prévia/detalhes
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, vexpand=True, hexpand=True)
+        for name, title, _g, _i, _d in self.PAGES:
+            holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.stack.add_named(holder, name)
+            self.builders[name] = (holder, getattr(self, f"_build_{name}"))
+        self.detail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16, margin_start=20, margin_end=20,
+                              margin_top=18, margin_bottom=18)
+        # o Clamp segura a largura: textos com quebra de linha pedem a largura da frase inteira
+        self.detail_clamp = Adw.Clamp(child=self.detail, maximum_size=380, tightening_threshold=380)
+        # sem hexpand: senão o GTK divide a sobra da janela entre o catálogo e o painel
+        self.detail_scroll = Gtk.ScrolledWindow(child=self.detail_clamp, vexpand=True,
+                                                hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.side_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, width_request=380)
+        self.side_panel = Gtk.Box()
+        self.side_panel.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        self.side_panel.append(self.side_slot)
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        back = Gtk.Button(css_classes=["flat"], halign=Gtk.Align.START, margin_start=12, margin_top=8)
+        self.back_label = Gtk.Label()
+        back_box = Gtk.Box(spacing=6)
+        back_box.append(Gtk.Image(icon_name="go-previous-symbolic"))
+        back_box.append(self.back_label)
+        back.set_child(back_box)
+        back.connect("clicked", lambda _b: self._close_detail())
+        page.append(back)
+        self.page_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
+        page.append(self.page_slot)
+        self.view = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT, hexpand=True)
+        self.view.add_named(self.stack, "catalogo")
+        self.view.add_named(page, "detalhe")
+        center = Gtk.Box(vexpand=True)
+        center.append(self.view)
+        center.append(self.side_panel)
+
+        # --- avisos e downloads em cima; aplicar/descartar sempre embaixo, sem cobrir nada
         self.notice = Gtk.Label(wrap=True, xalign=0, css_classes=["card", "studio-notice"])
-        self.notice_bar = Gtk.Revealer(child=self.notice, reveal_child=self.user_theme != "ok")
-        body.append(self.notice_bar)
-        if self.user_theme == "falta":
-            self.notice.set_label("O tema das janelas funciona, mas para mudar também o painel do sistema "
-                                  "falta a extensão “User Themes” (pacote gnome-shell-extensions).")
-        elif self.user_theme == "carregar":
+        self.notice_bar = Gtk.Revealer(child=self.notice, reveal_child=self.user_theme == "carregar")
+        if self.user_theme == "carregar":
             # instalada junto com o app, depois do login: o Shell aberto não a enxerga até sair e
             # entrar de novo. Pedir para ele instalá-la faz ele carregar na hora.
             self.notice.set_label("Para o painel do sistema também mudar de tema, confirme a instalação "
                                   "da extensão “User Themes” na janela que o GNOME abriu.")
             install_remote_extension(USER_THEME_UUID, self._user_theme_loaded,
                                      lambda: shell_extension_info(USER_THEME_UUID) not in (None, {}))
-        self.prog = Gtk.ProgressBar(show_text=True, margin_start=18, margin_end=18, margin_top=10)
+        self.prog = Gtk.ProgressBar(show_text=True, margin_start=24, margin_end=24, margin_top=10)
         self.prog_bar = Gtk.Revealer(child=self.prog)
-        body.append(self.prog_bar)
-        body.append(self.stack)
-        self.toasts.set_child(body)
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        main.append(self.notice_bar)
+        main.append(self.prog_bar)
+        main.append(center)
+        main.append(Gtk.Separator())
+        main.append(self._pending_bar())
+        self.main = main
+        # rodapé da lateral e barra de Aplicar sempre da mesma altura: as linhas acima delas se alinham
+        # em qualquer tema (cada tema muda o tamanho dos títulos e dos botões de um jeito)
+        self.footer_sizes = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.VERTICAL)
+        self.footer_sizes.add_widget(self.footer)
+        self.footer_sizes.add_widget(self.pending_box)
 
-        header = Adw.HeaderBar(title_widget=Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE))
-        restore = Gtk.Button(icon_name="edit-undo-symbolic", tooltip_text="Voltar ao visual original")
-        restore.connect("clicked", self._ask_restore)
-        header.pack_start(restore)
-        about = Gtk.Button(icon_name="help-about-symbolic", tooltip_text=f"Sobre o {APP_NAME}")
-        about.connect("clicked", self._about)
-        header.pack_end(about)
-        if hasattr(Adw, "ToolbarView"):
-            view = Adw.ToolbarView(content=self.toasts)
-            view.add_top_bar(header)
-        else:
-            view = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            view.append(header)
-            self.toasts.set_vexpand(True)
-            view.append(self.toasts)
+        root = Gtk.Box()
+        root.append(self.sidebar)
+        root.append(main)
+        # sonda de largura: decide o layout sem depender de Adw.Breakpoint (libadwaita 1.4+)
+        probe = Gtk.DrawingArea(can_target=False, hexpand=True, vexpand=True)
+        probe.connect("resize", lambda _a, w, _h: self._on_width(w))
+        overlay = Gtk.Overlay(child=root)
+        overlay.add_overlay(probe)
+        self.toasts = Adw.ToastOverlay(child=overlay, vexpand=True)
+
+        header = Adw.HeaderBar()
+        self.title_widget = Adw.WindowTitle(title=APP_NAME)
+        header.set_title_widget(self.title_widget)
+        self.menu_btn = Gtk.ToggleButton(icon_name="sidebar-show-symbolic", visible=False,
+                                         tooltip_text="Mostrar as seções")
+        self.menu_btn.connect("toggled", lambda b: self._show_sidebar(b.get_active()))
+        header.pack_start(self.menu_btn)
+        self.undo_btn = Gtk.Button(icon_name="edit-undo-symbolic", tooltip_text="Desfazer a última aplicação")
+        set_label(self.undo_btn, "Desfazer a última aplicação")
+        self.undo_btn.connect("clicked", lambda _b: self._ask_undo())
+        header.pack_start(self.undo_btn)
+        menu = Gio.Menu()
+        menu.append("Voltar ao visual original…", "win.restaurar")
+        menu.append(f"Sobre o {APP_NAME}", "win.sobre")
+        more = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Menu")
+        set_label(more, "Menu")
+        header.pack_end(more)
+        view = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        view.append(header)
+        view.append(self.toasts)
         self.set_content(view)
 
-        self.grids, self.builders = {}, {}
-        for name, title, icon, builder in self.PAGES:
-            holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            self.stack.add_titled(holder, name, title).set_icon_name(icon)
-            self.builders[name] = (holder, getattr(self, builder))
-        self.stack.connect("notify::visible-child-name", lambda *_: self._ensure_built())
-        self._ensure_built()
+        self.stack.connect("notify::visible-child-name", lambda *_: self._page_changed())
+        self._set_mode("largo")
+        self.nav.select_row(self.rows["estilos"])
+        self._page_changed()
+        self._refresh_chrome()
         self.store.fetch(self._on_catalog)
 
-    def _scan(self):
-        self.themes = {t.name: t for t in list_gtk_themes()}
-        self.icons = list_icon_themes()
-        self.cursors = dict(list_cursor_themes())
+    def _actions(self):
+        for name, fn in (("restaurar", self._ask_restore), ("sobre", self._about)):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", lambda *_a, fn=fn: fn())
+            self.add_action(act)
+
+    # ------------------------------------------------------------ navegação e layout
+    def _nav_header(self, row, before):
+        if before is None or before.group != row.group:
+            row.set_header(Gtk.Label(label=row.group, xalign=0, margin_start=14, margin_top=14 if before else 6,
+                                     margin_bottom=4, css_classes=["caption-heading", "dim-label"]))
+        else:
+            row.set_header(None)
+
+    def _nav_selected(self, _box, row):
+        if row is None or self._nav_sync:
+            return
+        self.stack.set_visible_child_name(row.page)
+        if self.mode == "estreito":
+            self.menu_btn.set_active(False)
+
+    def go(self, page):
+        self.stack.set_visible_child_name(page)
+
+    @property
+    def page(self):
+        return self.stack.get_visible_child_name()
+
+    def _page_changed(self):
+        name = self.page
+        self._ensure_built()
+        self._nav_sync = True
+        self.nav.select_row(self.rows[name])
+        self._nav_sync = False
+        self.title_widget.set_subtitle(self.PAGE[name][1])
+        self.back_label.set_label(f"Voltar para {self.PAGE[name][1]}")
+        picked = self.sel.selected(name)
+        self.detail_for = (name, next(iter(picked), None))
+        self.view.set_visible_child_name("catalogo")
+        self._render_detail()
+        self._refresh_chrome()
 
     def _ensure_built(self):
-        name = self.stack.get_visible_child_name()
+        name = self.page
         holder, builder = self.builders.get(name, (None, None))
         if builder:
             self.builders[name] = (holder, None)
             builder(holder)
+            self.refresh_marks()
 
     def rebuild(self, *names):
         """Relê o que está instalado e refaz as abas que já foram abertas."""
         self._scan()
         self.desk.link_cursor_themes()
-        for name, _t, _i, builder in self.PAGES:
+        for name, *_rest in self.PAGES:
             holder, pending = self.builders[name]
-            if (names and name not in names) or pending or name == "barra":
+            if (names and name not in names) or pending or (not names and name in ("barra", "efeitos")):
                 continue
             while child := holder.get_first_child():
                 holder.remove(child)
             self.grids.pop(name, None)
-            self.builders[name] = (holder, getattr(self, builder))
+            self.builders[name] = (holder, getattr(self, f"_build_{name}"))
         self._ensure_built()
+
+    @staticmethod
+    def mode_for(width):
+        return "largo" if width >= Window.WIDE else "medio" if width >= Window.NARROW else "estreito"
+
+    def _on_width(self, width):
+        mode = self.mode_for(width)
+        if mode != self.mode:
+            # mudar a árvore de widgets durante a alocação gera avisos do GTK: deixa para depois
+            GLib.idle_add(lambda: self._set_mode(mode) or False)
+
+    def _set_mode(self, mode):
+        if mode == self.mode:
+            return
+        self.mode = mode
+        slot = self.side_slot if mode == "largo" else self.page_slot
+        if self.detail_scroll.get_parent() is not slot:
+            if self.detail_scroll.get_parent():
+                self.detail_scroll.get_parent().remove(self.detail_scroll)
+            slot.append(self.detail_scroll)
+        self.side_panel.set_visible(mode == "largo")
+        self.detail_clamp.set_maximum_size(380 if mode == "largo" else 640)
+        if mode == "largo":
+            self.view.set_visible_child_name("catalogo")
+        narrow = mode == "estreito"
+        self.menu_btn.set_visible(narrow)
+        self.menu_btn.set_active(False)
+        self._show_sidebar(not narrow)
+        self._refresh_chrome()
+
+    def _show_sidebar(self, on):
+        """Na janela estreita a lista de seções vira uma tela própria, em vez de espremer o conteúdo."""
+        narrow = self.mode == "estreito"
+        self.sidebar.set_visible(on)
+        self.side.set_hexpand(narrow)
+        self.sidebar_sep.set_visible(not narrow)
+        self.main.set_visible(not (narrow and on))
+
+    def _open_detail(self):
+        if self.mode != "largo":
+            self.view.set_visible_child_name("detalhe")
+        self._refresh_chrome()
+
+    def _close_detail(self):
+        self.view.set_visible_child_name("catalogo")
+        self._refresh_chrome()
+
+    def detail_visible(self):
+        return self.mode == "largo" or self.view.get_visible_child_name() == "detalhe"
+
+    # ------------------------------------------------------------ barra de alterações pendentes
+    def _pending_bar(self):
+        bar = self.pending_box = Gtk.Box(spacing=8, margin_start=18, margin_end=18, margin_top=10, margin_bottom=10)
+        self.pending_label = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+        bar.append(self.pending_label)
+        self.review_btn = Gtk.Button(label="Revisar")
+        self.review_btn.connect("clicked", lambda _b: self._open_detail())
+        bar.append(self.review_btn)
+        self.discard_btn = Gtk.Button(label="Descartar")
+        self.discard_btn.connect("clicked", lambda _b: self.discard())
+        bar.append(self.discard_btn)
+        self.apply_btn = Gtk.Button(css_classes=["suggested-action"])
+        inner = Gtk.Box(spacing=8)
+        self.apply_spin = Spinner(16)
+        self.apply_spin.set_visible(False)
+        inner.append(self.apply_spin)
+        self.apply_text = Gtk.Label(label="Aplicar")
+        inner.append(self.apply_text)
+        self.apply_btn.set_child(inner)
+        self.apply_btn.connect("clicked", lambda _b: self.apply())
+        bar.append(self.apply_btn)
+        return bar
+
+    def _refresh_chrome(self):
+        """Texto e botões da barra de baixo, desfazer e “Visual atual”."""
+        if not hasattr(self, "apply_btn"):
+            return
+        on = self.sel.enabled()
+        total = len(self.sel.changes)
+        if self.applying:
+            text = "Aplicando…"
+        elif not total:
+            text = "Nenhuma alteração pendente. Clique num item para ver a prévia."
+        elif not on:
+            text = "Nenhum componente marcado para aplicar."
+        else:
+            text = f"{len(on)} alteração pendente" if len(on) == 1 else f"{len(on)} alterações pendentes"
+            text += ": " + human_list(c.title for c in self.sel.for_reading() if c.enabled)
+            need = self.sel.needs()
+            if need:
+                text += f" · baixa {mb(sum(i['bytes'] for i in need))} ao aplicar"
+        self.pending_label.set_label(text)
+        self.apply_btn.set_sensitive(bool(on) and not self.applying and not self.busy)
+        self.discard_btn.set_sensitive(bool(total) and not self.applying)
+        self.review_btn.set_visible(bool(total) and not self.detail_visible())
+        self.apply_text.set_label("Aplicando…" if self.applying else "Aplicar")
+        self.apply_spin.set_visible(self.applying)
+        (self.apply_spin.start if self.applying else self.apply_spin.stop)()
+        self.undo_btn.set_sensitive(self.desk.has_previous() and not self.applying)
+        self.current_label.set_label(self._current_name())
+
+    def _current_name(self):
+        cur = self.desk.current()
+        style = self._style_in_use()
+        if style:
+            return style
+        if cur["icons"].startswith(FOLDER_PREFIX):
+            return "Paleta de cores"
+        return pretty(cur["gtk"])
+
+    # ------------------------------------------------------------ seleção → prévia → aplicar
+    def _pick(self, page, key):
+        """Clicar num cartão seleciona e mostra a prévia. Nada muda no sistema até “Aplicar”."""
+        if self.applying:
+            return
+        dropped = []
+        for change in self._changes_for(page, key):
+            dropped += self.sel.set(change)
+        self.detail_for = (page, key)
+        self._selection_changed()
+        self._open_detail()
+        if dropped:
+            self.toast(f"{human_list(dropped)} saiu da seleção: não dá para aplicar junto com "
+                       f"{'a paleta' if page == 'cores' else 'este item'}")
+
+    def _changes_for(self, page, key):
+        src = (page, key)
+        if page == "estilos":
+            p = self.packs[key]
+            out = [Change("tema", p["gtk"], pretty(p["gtk"]), lambda n=p["gtk"]: self._apply_theme(n),
+                          self._need(p["gtk"], self.themes), src)]
+            if p["icon"]:
+                out.append(Change("icones", p["icon"], pretty(p["icon"]), lambda n=p["icon"]: self._apply_icons(n),
+                                  self._need(p["icon"], self.icons), src))
+            if p["cursor"]:
+                out.append(Change("cursor", p["cursor"], pretty(p["cursor"]),
+                                  lambda n=p["cursor"]: self._apply_cursor(n), self._need(p["cursor"], self.cursors),
+                                  src))
+            wall = WALLS / f"{p['wall']}.svg"
+            out.append(Change("wallpaper", str(wall), f"Gerado: {key}", lambda: self.desk.apply_wallpaper(wall),
+                              source=src))
+            return out
+        if page == "cores":
+            p = self.palettes[key]
+            return [Change("cores", key, f"{p['title']} · {color_name(p['accent'])} · papel de parede "
+                                         f"{dict(WALL_DESIGNS)[p['design']].lower()}",
+                           lambda: self.desk.apply_palette(p), source=src)]
+        if page == "temas":
+            return [Change("tema", key, pretty(key), lambda: self._apply_theme(key), source=src)]
+        if page == "icones":
+            return [Change("icones", key, pretty(key), lambda: self._apply_icons(key), source=src)]
+        if page == "cursores":
+            return [Change("cursor", key, pretty(key), lambda: self._apply_cursor(key), source=src)]
+        if page == "wallpaper":
+            path = Path(key)
+            return [Change("wallpaper", key, pretty(path.stem), lambda: self._apply_wall(path), source=src)]
+        if page == "meus":
+            st = next((s for s in load_styles() if s["name"] == key), None)
+            out = []
+            for comp, field, have, fn in (("tema", "gtk", self.themes, self._apply_theme),
+                                          ("icones", "icons", self.icons, self._apply_icons),
+                                          ("cursor", "cursor", self.cursors, self._apply_cursor)):
+                if st and st.get(field) in have:
+                    out.append(Change(comp, st[field], pretty(st[field]), lambda n=st[field], fn=fn: fn(n),
+                                      source=src))
+            if st and st.get("wallpaper") and Path(st["wallpaper"]).exists():
+                w = Path(st["wallpaper"])
+                out.append(Change("wallpaper", str(w), pretty(w.stem), lambda: self._apply_wall(w), source=src))
+            return out
+        return []
+
+    def _need(self, name, installed):
+        if name in installed:
+            return []
+        item = self.store.provider(name)
+        return self.store.with_needs([item]) if item else []
+
+    # aplicação de cada componente: confere na hora se ainda está instalado
+    def _apply_theme(self, name):
+        if name not in self.themes:
+            raise NotInstalled(f"o tema {pretty(name)} não está instalado")
+        self.desk.apply_gtk(self.themes[name])
+
+    def _apply_icons(self, name):
+        if name not in self.icons:
+            raise NotInstalled(f"os ícones {pretty(name)} não estão instalados")
+        self.desk.apply_icons(name)
+
+    def _apply_cursor(self, name):
+        if name not in self.cursors:
+            raise NotInstalled(f"o cursor {pretty(name)} não está instalado")
+        self.desk.apply_cursor(name)
+
+    def _apply_wall(self, path):
+        if not Path(path).exists():
+            raise NotInstalled("a imagem não existe mais")
+        self.desk.apply_wallpaper(path)
+
+    def _selection_changed(self):
+        self.refresh_marks()
+        self._render_detail()
+        self._refresh_chrome()
+
+    def discard(self):
+        """Joga fora as escolhas pendentes; os controles da barra e do vidro voltam ao do sistema."""
+        self.sel.clear()
+        self._reset_drafts()
+        self.detail_for = (self.page, None)
+        self._selection_changed()
+
+    def apply(self):
+        """Aplica só o que está marcado. Antes, guarda o visual atual para o “Desfazer”."""
+        if self.applying or not self.sel.enabled():
+            return
+        self.applying = True
+        self._refresh_chrome()
+        need = self.sel.needs()
+
+        def work(download_err, covered):
+            try:
+                self.desk.snapshot(PREVIOUS)
+            except OSError as e:
+                self.toast(f"Não deu para guardar o ponto de desfazer: {e}")
+            ok, failed = self.sel.apply()
+
+            def done():
+                if covered:
+                    self.curtain.uncover()
+                self._applied(ok, failed, download_err)
+                return False
+            # com a cortina, espera o sistema redesenhar (Shell, Nautilus, ícones) antes de mostrar
+            GLib.timeout_add(self.SETTLE_MS if covered else self.MIN_LOAD_MS, done)
+            return False
+
+        def run(download_err=None):
+            # depois do download: só então se sabe a cor do tema novo
+            if self.HEAVY & {c.key for c in self.sel.enabled()}:
+                bg, accent = self._target_colors()
+                self.curtain.cover(bg, lambda: work(download_err, True), accent)
+            else:
+                work(download_err, False)
+            return False
+        if need:
+            self._download(need, "Baixando o que falta para aplicar…", run)
+        else:
+            GLib.timeout_add(80, run)
+
+    def _target_colors(self):
+        """Fundo e destaque do visual que está chegando (a cortina usa os dois, para a troca parecer
+        contínua: tema claro → cortina clara)."""
+        ch = self.sel.changes
+        if "cores" in ch and ch["cores"].enabled and ch["cores"].value in getattr(self, "palettes", {}):
+            p = self.palettes[ch["cores"].value]
+            return p["bg"], p["accent"]
+        if "tema" in ch and ch["tema"].enabled and ch["tema"].value in self.themes:
+            bg, _base, _fg, acc = theme_palette(self.themes[ch["tema"].value])
+            return bg.to_string(), acc.to_string()
+        ok, color = self.get_style_context().lookup_color("window_bg_color")
+        return (color.to_string() if ok else "#242424"), None
+
+    def _follow_theme(self):
+        """Apps GTK 4 só leem ~/.config/gtk-4.0/gtk.css ao abrir (por isso o Nautilus é reaberto).
+        Depois de aplicar, o próprio app relê o arquivo para ficar com as cores do tema novo."""
+        display = self.get_display()
+        if self.theme_css:
+            Gtk.StyleContext.remove_provider_for_display(display, self.theme_css)
+        self.theme_css = Gtk.CssProvider()
+        css = GTK4_CFG / "gtk.css"
+        try:
+            if css.exists():
+                self.theme_css.load_from_path(str(css))
+        except GLib.Error:
+            return
+        # acima do gtk.css que o GTK leu ao abrir (o do tema antigo)
+        Gtk.StyleContext.add_provider_for_display(display, self.theme_css, Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+
+    def _applied(self, ok, failed, download_err):
+        self.applying = False
+        if {"Tema", "Paleta de cores"} & set(ok):
+            self._follow_theme()
+        self._reset_drafts()
+        if failed or download_err:
+            lines = []
+            if ok:
+                lines.append("Aplicado: " + human_list(ok) + ".")
+            for title, why in failed:
+                lines.append(f"Não aplicado — {title}: {why}.")
+            if download_err:
+                lines.append(f"Download com problema: {download_err}.")
+            lines.append("O que falhou continua na seleção para você tentar de novo.")
+            inform(self, "Parte das alterações não foi aplicada" if ok else "Nada foi aplicado", "\n".join(lines))
+        else:
+            hint = " — apps abertos podem precisar ser reabertos" if set(ok) & {"Tema", "Paleta de cores",
+                                                                                 "Cursor"} else ""
+            self.toast(f"Aplicado: {human_list(ok)}{hint}")
+        self.detail_for = (self.page, self.detail_for[1] if self.detail_for else None)
+        self._selection_changed()
+
+    def refresh_marks(self):
+        cur = self.desk.current()
+        in_use = {"temas": cur["gtk"], "icones": cur["icons"], "cursores": cur["cursor"],
+                  "wallpaper": cur["wallpaper"], "estilos": self._style_in_use(), "meus": self._my_style_in_use(),
+                  "barra": self._preset_in_use("barra"), "efeitos": self._preset_in_use("efeitos")}
+        for name, grid in self.grids.items():
+            grid.mark(in_use.get(name))
+            if name in ("barra", "efeitos"):
+                grid.select([k for k in [self._preset_picked(name)] if k and k != in_use[name]])
+            else:
+                grid.select(self.sel.selected(name))
+
+    def _style_in_use(self):
+        cur = self.desk.current()
+        for title, p in getattr(self, "packs", {}).items():
+            if (p["gtk"], p["icon"], p["cursor"]) == (cur["gtk"], cur["icons"], cur["cursor"]):
+                return title
+        return None
+
+    def _my_style_in_use(self):
+        cur = self.desk.current()
+        return next((s["name"] for s in load_styles() if (s.get("gtk"), s.get("icons"), s.get("cursor")) ==
+                     (cur["gtk"], cur["icons"], cur["cursor"])), None)
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
 
     def _user_theme_loaded(self, result):
         self.user_theme = self.desk.ensure_user_theme() if result == "ok" else "carregar"
@@ -1526,73 +2993,64 @@ class Window(Adw.ApplicationWindow):
         else:
             self.notice.set_label("O tema das janelas já funciona. O painel do sistema muda de tema depois "
                                   "que você sair e entrar de novo na sessão.")
+        self._render_detail()
 
-    def toast(self, text):
-        self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
+    def _scan(self):
+        self.themes = {t.name: t for t in list_gtk_themes()}
+        self.icons = list_icon_themes()
+        self.cursors = dict(list_cursor_themes())
 
-    MIN_LOAD_MS = 600  # o sistema leva um instante para redesenhar; abaixo disso a animação só pisca
-
-    def _feedback(self, page, key, apply, message):
-        """Carregando no cartão → aplica → ✓. O atraso inicial deixa o círculo aparecer antes do trabalho."""
-        grid = self.grids.get(page)
-        if grid:
-            grid.start(key)
-
-        def run():
-            try:
-                apply()
-            except Exception:
-                if grid:
-                    grid.finish(key, ok=False)
-                raise
-            GLib.timeout_add(self.MIN_LOAD_MS, done)
-            return False
-
-        def done():
-            if grid:
-                grid.finish(key)
-            self.refresh_marks()
-            self.toast(message)
-            return False
-        GLib.timeout_add(80, run)
-
-    def refresh_marks(self):
-        i = self.desk.iface
-        current = {"temas": i.get_string("gtk-theme"), "icones": i.get_string("icon-theme"),
-                   "cursores": i.get_string("cursor-theme"),
-                   "wallpaper": Gio.File.new_for_uri(self.desk.bg.get_string("picture-uri")).get_path()}
-        for name, grid in self.grids.items():
-            if name in current:
-                grid.mark(current[name])
-
-    def _download(self, items, label, then, fail=None):
+    def _download(self, items, label, done):
+        """Baixa e instala; done(None ou texto do erro) é chamado sempre, depois de reler o que existe."""
         if self.busy:
             self.toast("Espere o download atual terminar")
-            if fail:
-                fail()
-            return
+            return False
         self.busy = True
         self.prog.set_text(label)
         self.prog.set_fraction(0)
         self.prog_bar.set_reveal_child(True)
+        self._refresh_chrome()
 
-        def done(err):
+        def finished(err):
             self.busy = False
             self.prog_bar.set_reveal_child(False)
-            if err:
-                self.toast(f"Não deu para baixar: {err}")
-                if fail:
-                    fail()
-                return
             self.rebuild()
-            then()
-        self.store.install(items, self.prog.set_fraction, done)
+            done(err)
+            self._refresh_chrome()
+        self.store.install(items, self.prog.set_fraction, finished)
+        return True
 
     def _on_catalog(self, ok):
-        if ok:
-            self.rebuild("combos", "loja")
+        self.store_loading = False
+        self.rebuild("estilos", "explorar")
+        if not ok and self.page == "explorar":
+            self._render_detail()
 
-    # --- combos
+    def _retry_catalog(self):
+        self.store_loading = True
+        self.rebuild("explorar")
+        self.store.fetch(self._on_catalog)
+
+    # ------------------------------------------------------------ cabeçalho das páginas
+    def _page_header(self, holder, name, extra=None):
+        box = Gtk.Box(spacing=12, margin_start=24, margin_end=24, margin_top=20)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        text.append(Gtk.Label(label=self.PAGE[name][1], xalign=0, wrap=True, css_classes=["title-1"]))
+        text.append(Gtk.Label(label=self.PAGE[name][4], xalign=0, wrap=True, css_classes=["dim-label"]))
+        box.append(text)
+        if extra:
+            extra.set_valign(Gtk.Align.CENTER)
+            box.append(extra)
+        holder.append(box)
+
+    @staticmethod
+    def _tone_filters(tags):
+        """Filtro Escuros/Claros só quando existem os dois (filtro que sempre dá vazio só atrapalha)."""
+        if {"escuro", "claro"} <= set(tags):
+            return [("Todos", None), ("Escuros", "escuro"), ("Claros", "claro")]
+        return None
+
+    # ------------------------------------------------------------ estilos prontos
     def _resolve(self, pack):
         title, gtks, icons, cursors, wall = pack
         need = []
@@ -1613,380 +3071,496 @@ class Window(Adw.ApplicationWindow):
         return dict(title=title, gtk=gtk, icon=pick(icons, self.icons), cursor=pick(cursors, self.cursors),
                     wall=wall, need=self.store.with_needs(need))
 
-    def _build_combos(self, holder):
-        grid = self.grids["combos"] = Grid(self._pick_combo, search=False)
-        holder.append(grid)
+    def _pack_palette(self, p):
+        colors = WALL_PALETTES[p["wall"]]
+        if p["gtk"] in self.themes:
+            return theme_palette(self.themes[p["gtk"]])
+        return rgba(colors[0]), mix(rgba(colors[1]), rgba("#000000"), .2), rgba("#e6e6f0"), rgba(colors[2])
+
+    def _build_estilos(self, holder):
+        self._page_header(holder, "estilos")
         self.packs = {}
         for pack in PACKS:
             p = self._resolve(pack)
-            if not p:
-                continue
-            self.packs[p["title"]] = p
-            colors = WALL_PALETTES[p["wall"]]
-            if p["gtk"] in self.themes:
-                pal = theme_palette(self.themes[p["gtk"]])
-            else:
-                pal = (rgba(colors[0]), mix(rgba(colors[1]), rgba("#000000"), .2), rgba("#e6e6f0"), rgba(colors[2]))
-
-            def paint(cr, w, h, pal=pal, colors=colors):
-                draw_backdrop(cr, w, h, colors)
-                draw_window(cr, 26, 22, w - 52, h - 44, pal)
+            if p:
+                self.packs[p["title"]] = p
+        tags = {"escuro" if is_dark(self._pack_palette(p)) else "claro" for p in self.packs.values()}
+        empty = status_page("view-grid-symbolic", "Nenhum estilo disponível",
+                            "Os estilos usam temas que vêm do catálogo do Explorar." +
+                            (" Carregando o catálogo…" if self.store_loading else
+                             " Confira sua conexão e tente de novo."),
+                            None if self.store_loading else "Tentar de novo", self._retry_catalog)
+        grid = self.grids["estilos"] = Grid(lambda k: self._pick("estilos", k), placeholder="Buscar estilos…",
+                                            filters=self._tone_filters(tags), empty=empty)
+        holder.append(grid)
+        grid.set_loading(self.store_loading and not self.packs)
+        for title, p in self.packs.items():
+            pal = self._pack_palette(p)
+            dark = is_dark(pal)
+            sub = "Escuro" if dark else "Claro"
             if p["need"]:
-                sub = f"Baixa {mb(sum(i['bytes'] for i in p['need']))} ao aplicar"
-            else:
-                sub = " · ".join(pretty(x) for x in (p["gtk"], p["icon"], p["cursor"]) if x)
-            grid.add(p["title"], drawing(260, 160, paint), p["title"], sub)
+                sub += f" · baixa {mb(sum(i['bytes'] for i in p['need']))}"
+            colors = WALL_PALETTES[p["wall"]]
+            grid.add(title, desktop_preview(WALLS / f"{p['wall']}.svg", pal,
+                                            p["icon"] if p["icon"] in self.icons else None, 250, 140),
+                     title, sub, tags={"escuro" if dark else "claro"}, colors=[colors[2], colors[3], pal[3]])
 
-    def _pick_combo(self, title):
-        p = self.packs[title]
-        if not p["need"]:
-            self._feedback("combos", title, lambda: self._apply_combo(title), f"Combo {title} aplicado")
-            return
-        self.grids["combos"].start(title)
-        # depois do download a aba é refeita (rebuild), então o cartão novo recebe o carregando de novo
-        self._download(p["need"], f"Baixando o combo {title}…",
-                       lambda: self._feedback("combos", title, lambda: self._apply_combo(title),
-                                              f"Combo {title} aplicado"),
-                       fail=lambda: self.grids["combos"].finish(title, ok=False))
+    def _detail_estilos(self, key):
+        p = self.packs.get(key)
+        if not p:
+            return None
+        rows = [("Tema", pretty(p["gtk"]), p["gtk"] in self.themes), ("Ícones", pretty(p["icon"] or "—"),
+                                                                      not p["icon"] or p["icon"] in self.icons),
+                ("Cursor", pretty(p["cursor"] or "—"), not p["cursor"] or p["cursor"] in self.cursors),
+                ("Papel de parede", f"Gerado: {key}", True)]
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        for title, value, have in rows:
+            line = Gtk.Box(spacing=8)
+            line.append(Gtk.Label(label=title, xalign=0, hexpand=True, css_classes=["dim-label"]))
+            line.append(Gtk.Label(label=value + ("" if have else " (será baixado)"), xalign=1, wrap=True))
+            info.append(line)
+        notes = []
+        if p["need"]:
+            notes.append(f"Ao aplicar, baixa {mb(sum(i['bytes'] for i in p['need']))} do catálogo do Explorar "
+                         f"({human_list(i['title'] for i in p['need'])}).")
+        notes += limitations("tema", self.env())
+        return dict(preview=desktop_preview(WALLS / f"{p['wall']}.svg", self._pack_palette(p),
+                                            p["icon"] if p["icon"] in self.icons else None, 340, 190),
+                    caption=ILLUSTRATIVE + (" Os ícones do dock são do tema escolhido." if p["icon"] in self.icons
+                                            else " Os ícones aparecem depois do download."),
+                    title=key, subtitle="Escuro" if is_dark(self._pack_palette(p)) else "Claro",
+                    extra=info, notes=notes, in_use=self._style_in_use() == key)
 
-    def _apply_combo(self, title):
-        p = self._resolve(next(x for x in PACKS if x[0] == title))
-        if p["gtk"] in self.themes:
-            self.desk.apply_gtk(self.themes[p["gtk"]])
-        if p["icon"] in self.icons:
-            self.desk.apply_icons(p["icon"])
-        if p["cursor"] in self.cursors:
-            self.desk.apply_cursor(p["cursor"])
-        self.desk.apply_wallpaper(WALLS / f"{p['wall']}.svg")
-
-    # --- cores
-    def _build_colors(self, holder):
-        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_start=18, margin_end=18, margin_top=16)
-        top.append(Gtk.Label(label="Qual é a sua cor favorita?", xalign=0, css_classes=["title-2"]))
-        top.append(Gtk.Label(label="A gente monta paletas que combinam com ela: as cores das janelas, o destaque "
-                                   "do sistema e um wallpaper novo.", xalign=0, wrap=True, css_classes=["dim-label"]))
-        row = Gtk.Box(spacing=8, margin_top=8)
+    # ------------------------------------------------------------ cores
+    def _build_cores(self, holder):
+        self._page_header(holder, "cores")
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_start=24, margin_end=24, margin_top=14)
+        top.append(Gtk.Label(label="Sua cor favorita", xalign=0, css_classes=["heading"]))
+        row = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=12, min_children_per_line=3,
+                          column_spacing=4, row_spacing=4)
+        self.color_buttons, first = {}, None
         for name, hexa in FAVORITE_COLORS:
-            dot = drawing(30, 30, lambda cr, w, h, c=rgba(hexa): (_src(cr, c), cr.arc(w / 2, h / 2, w / 2, 0, 2 * pi),
-                                                                cr.fill()))
-            btn = Gtk.Button(child=dot, tooltip_text=name, css_classes=["flat", "circular"])
-            btn.connect("clicked", lambda _b, c=hexa: self._fill_palettes(c))
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            dot = drawing(28, 28, lambda cr, w, h, c=rgba(hexa): (
+                _src(cr, c), cr.arc(w / 2, h / 2, min(w, h) / 2 - 1, 0, 2 * pi), cr.fill()))
+            dot.set_halign(Gtk.Align.CENTER)  # não estica junto com o nome da cor
+            box.append(dot)
+            box.append(Gtk.Label(label=name, css_classes=["caption"]))
+            btn = Gtk.ToggleButton(child=box, css_classes=["flat"])
+            if first:
+                btn.set_group(first)
+            first = first or btn
+            set_label(btn, f"Cor {name}")
+            btn.connect("toggled", lambda b, c=hexa: b.get_active() and self._fill_palettes(c))
+            self.color_buttons[hexa] = btn
             row.append(btn)
         if hasattr(Gtk, "ColorDialogButton"):
-            other = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False), tooltip_text="Outra cor…",
+            other = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False),
                                           rgba=rgba(getattr(self, "fav_color", FAVORITE_COLORS[0][1])))
             other.connect("notify::rgba", lambda b, _p: self._fill_palettes(b.get_rgba().to_string()))
         else:
-            other = Gtk.ColorButton(use_alpha=False, tooltip_text="Outra cor…",
-                                    rgba=rgba(getattr(self, "fav_color", FAVORITE_COLORS[0][1])))
+            other = Gtk.ColorButton(use_alpha=False, rgba=rgba(getattr(self, "fav_color", FAVORITE_COLORS[0][1])))
             other.connect("color-set", lambda b: self._fill_palettes(b.get_rgba().to_string()))
         other.set_valign(Gtk.Align.CENTER)
+        other.set_tooltip_text("Escolher outra cor")
+        set_label(other, "Escolher outra cor")
         self.color_btn = other
-        row.append(other)
+        obox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        obox.append(other)
+        obox.append(Gtk.Label(label="Outra…", css_classes=["caption"]))
+        row.append(obox)
         top.append(row)
+        self.color_chosen = Gtk.Label(xalign=0, css_classes=["dim-label"])
+        top.append(self.color_chosen)
+        top.append(Gtk.Label(label="Desenho do papel de parede", xalign=0, css_classes=["heading"], margin_top=8))
+        designs = Gtk.Box(spacing=8)
+        group = Gtk.Box(css_classes=["linked"])
+        first = None
+        self.wall_design = getattr(self, "wall_design", WALL_DESIGNS[0][0])
+        self.wall_seed = getattr(self, "wall_seed", 0)
+        for key, label in WALL_DESIGNS:
+            b = Gtk.ToggleButton(label=label, active=key == self.wall_design)
+            if first:
+                b.set_group(first)
+            first = first or b
+            b.connect("toggled", lambda b, k=key: b.get_active() and self._set_design(k, self.wall_seed))
+            group.append(b)
+        designs.append(group)
+        vary = Gtk.Button(label="Variar desenho", tooltip_text="Outra versão do mesmo desenho, nas mesmas cores")
+        vary.connect("clicked", lambda _b: self._set_design(self.wall_design, self.wall_seed + 1))
+        designs.append(vary)
+        top.append(designs)
         holder.append(top)
-        self.grids["cores"] = Grid(self._pick_palette, search=False)
+        self.grids["cores"] = Grid(lambda k: self._pick("cores", k), search=False)
         holder.append(self.grids["cores"])
         self._fill_palettes(getattr(self, "fav_color", FAVORITE_COLORS[0][1]))
 
-    def _fill_palettes(self, color):
+    def _set_design(self, design, seed):
+        self.wall_design, self.wall_seed = design, seed
+        self._fill_palettes(self.fav_color, force=True)
+
+    def _fill_palettes(self, color, force=False):
         grid = self.grids.get("cores")
         if not grid or grid.working:  # a grade ainda não existe enquanto a aba está sendo montada
             return
-        if grid.cards and rgba(color).equal(rgba(self.fav_color)):
+        if grid.cards and rgba(color).equal(rgba(self.fav_color)) and not force:
             return
         self.fav_color = color
         if not self.color_btn.get_rgba().equal(rgba(color)):  # o botão mostra a cor escolhida
             self.color_btn.set_rgba(rgba(color))
+        # a bolinha marcada é sempre a cor escolhida; cor própria (“Outra…”) não marca nenhuma
+        for hexa, btn in self.color_buttons.items():
+            should = rgba(hexa).equal(rgba(color))
+            if btn.get_active() != should:
+                btn.set_active(should)
+        self.color_chosen.set_label(f"Cor escolhida: {color_name(color)} ({rgba(color).to_string()})")
         grid.clear()
-        self.palettes = {p["key"]: p for p in make_palettes(color)}
-        for p in self.palettes.values():
-            pal = tuple(map(rgba, (p["bg"], p["base"], p["fg"], p["accent"])))
+        self.palettes = {}
+        for p in make_palettes(color):
+            # a chave leva cor, desenho e semente: trocar a cor não deixa marcado um cartão que já é outro
+            p.update(design=self.wall_design, seed=self.wall_seed)
+            key = f"{p['key']}|{p['accent']}|{self.wall_design}|{self.wall_seed}"
+            self.palettes[key] = p
+            grid.add(key, self._palette_preview(p, 250, 140), p["title"],
+                     f"{'Escura' if p['dark'] else 'Clara'} · {color_name(p['accent'])} e "
+                     f"{color_name(p['accent2']).lower()}", colors=[p["accent"], p["accent2"], p["bg"]])
+        self.refresh_marks()
 
-            def paint(cr, w, h, pal=pal, wall=p["wall"]):
-                draw_backdrop(cr, w, h, wall)
-                draw_window(cr, 26, 22, w - 52, h - 44, pal)
-            grid.add(p["key"], drawing(260, 160, paint), p["title"],
-                     f"{'Escura' if p['dark'] else 'Clara'} · {p['accent']} + {p['accent2']}")
+    @staticmethod
+    def _palette_preview(p, w, h):
+        """O papel de parede de verdade (o SVG que será gravado) com uma janela nas cores da paleta."""
+        base = picture(width_request=w, height_request=h, css_classes=["studio-thumb"], overflow=Gtk.Overflow.HIDDEN)
+        try:
+            base.set_paintable(svg_texture(design_svg(p["wall"], p["design"], p["seed"]), w, h))
+        except GLib.Error:
+            pass
+        pal = tuple(map(rgba, (p["bg"], p["base"], p["fg"], p["accent"])))
 
-    def _pick_palette(self, key):
-        p = self.palettes[key]
-        self._feedback("cores", key, lambda: self.desk.apply_palette(p),
-                       f"Paleta {p['title']} aplicada — apps abertos podem precisar ser reabertos")
+        def paint(cr, ww, hh):
+            s = (ww * .64) / 300
+            cr.save()
+            cr.translate(ww * .18, hh * .16)
+            cr.scale(s, s)
+            draw_window(cr, 0, 0, 300, hh * .64 / s, pal)
+            cr.restore()
+        overlay = Gtk.Overlay(child=base, halign=Gtk.Align.CENTER)
+        overlay.add_overlay(drawing(w, h, paint))
+        return overlay
 
-    # --- temas
-    def _build_themes(self, holder):
-        grid = self.grids["temas"] = Grid(self._pick_theme)
+    def _detail_cores(self, key):
+        p = getattr(self, "palettes", {}).get(key)
+        if not p:
+            return None
+        sw = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for label, c in (("Destaque", p["accent"]), ("Segundo tom", p["accent2"]), ("Fundo das janelas", p["bg"]),
+                         ("Conteúdo", p["base"]), ("Texto", p["fg"])):
+            line = Gtk.Box(spacing=8)
+            line.append(dots([c], 16))
+            line.append(Gtk.Label(label=label, xalign=0, hexpand=True))
+            line.append(Gtk.Label(label=f"{color_name(c)} · {c}", css_classes=["dim-label", "caption"]))
+            sw.append(line)
+        sw.append(Gtk.Label(label=p["tech"], xalign=0, wrap=True, css_classes=["dim-label", "caption"],
+                            margin_top=4))
+        design = dict(WALL_DESIGNS)[p["design"]]
+        return dict(preview=self._palette_preview(p, 340, 190),
+                    caption=f"O papel de parede é o de verdade ({design.lower()}, variação {p['seed'] + 1}); "
+                            "a janela é uma ilustração com as cores da paleta.",
+                    title=f"Paleta {p['title']}",
+                    subtitle=f"{'Escura' if p['dark'] else 'Clara'} · a partir de {color_name(self.fav_color)}",
+                    extra=sw, notes=limitations("cores", self.env()))
+
+    # ------------------------------------------------------------ temas, ícones, cursores, wallpaper
+    def _go_explore(self, kind):
+        self.go("explorar")
+        grid = self.grids.get("explorar")
+        if grid:
+            grid.filter_kind(kind)
+
+    def _build_temas(self, holder):
+        self._page_header(holder, "temas")
+        pals = {n: theme_palette(t) for n, t in self.themes.items()}
+        tags = {"escuro" if is_dark(p) else "claro" for p in pals.values()}
+        grid = self.grids["temas"] = Grid(
+            lambda k: self._pick("temas", k), placeholder="Buscar temas…", filters=self._tone_filters(tags),
+            empty=status_page("preferences-desktop-appearance-symbolic", "Nenhum tema instalado",
+                              "Baixe temas no Explorar.", "Explorar temas", lambda: self._go_explore("gtk")))
         holder.append(grid)
+        grid.set_loading(True)
 
         def add(theme):
-            pal = theme_palette(theme)
-            grid.add(theme.name, drawing(240, 140, lambda cr, w, h, pal=pal: draw_window(cr, 6, 6, w - 12, h - 14, pal)),
-                     pretty(theme.name))
-        add_batched(self.themes.values(), add, self.refresh_marks)
+            dark = is_dark(pals[theme.name])
+            grid.add(theme.name, window_preview(pals[theme.name], 230, 130), pretty(theme.name),
+                     "Escuro" if dark else "Claro", tags={"escuro" if dark else "claro"})
+        add_batched(self.themes.values(), add, lambda: (grid.set_loading(False), self.refresh_marks()))
 
-    def _pick_theme(self, name):
-        self._feedback("temas", name, lambda: self.desk.apply_gtk(self.themes[name]),
-                       f"Tema {pretty(name)} aplicado — apps abertos podem precisar ser reabertos")
+    def _detail_temas(self, key):
+        theme = self.themes.get(key)
+        if not theme:
+            return None
+        parts = [n for n, d in (("GTK 3", "gtk-3.0"), ("GTK 4", "gtk-4.0"), ("painel do GNOME", "gnome-shell"))
+                 if (theme.path / d).is_dir()]
+        notes = limitations("tema", self.env())
+        if "painel do GNOME" not in parts:
+            notes.insert(0, "Este tema não traz estilo para o painel do GNOME: o painel fica como está.")
+        return dict(preview=window_preview(theme_palette(theme), 340, 200),
+                    caption="Ilustração com as cores lidas do tema; botões e detalhes reais variam por app.",
+                    title=pretty(key), subtitle="Inclui: " + human_list(parts), notes=notes,
+                    in_use=self.desk.current()["gtk"] == key)
 
-    # --- ícones
-    def _build_icons(self, holder):
-        grid = self.grids["icones"] = Grid(self._pick_icons)
+    def _build_icones(self, holder):
+        self._page_header(holder, "icones")
+        grid = self.grids["icones"] = Grid(
+            lambda k: self._pick("icones", k), placeholder="Buscar ícones…",
+            empty=status_page("folder-pictures-symbolic", "Nenhum tema de ícones instalado",
+                              "Baixe ícones no Explorar.", "Explorar ícones", lambda: self._go_explore("icons")))
         holder.append(grid)
-        add_batched(self.icons, lambda n: grid.add(n, icon_preview(n), pretty(n)), self.refresh_marks)
+        grid.set_loading(True)
+        add_batched(self.icons, lambda n: grid.add(n, icon_preview(n), pretty(n)),
+                    lambda: (grid.set_loading(False), self.refresh_marks()))
 
-    def _pick_icons(self, name):
-        self._feedback("icones", name, lambda: self.desk.apply_icons(name), f"Ícones {pretty(name)} aplicados")
+    def _detail_icones(self, key):
+        imgs = [Gtk.Image(paintable=p, pixel_size=48) for p in icon_paintables(key, 48)]
+        return dict(preview=labeled_samples(imgs, ICON_LABELS, 48),
+                    caption="Ícones de verdade do tema, sempre os mesmos aplicativos para comparar.",
+                    title=pretty(key), subtitle="Tema de ícones", notes=limitations("icones", self.env()),
+                    in_use=self.desk.current()["icons"] == key)
 
-    # --- cursores
-    def _build_cursors(self, holder):
-        grid = self.grids["cursores"] = Grid(self._pick_cursor)
+    def _build_cursores(self, holder):
+        self._page_header(holder, "cursores")
+        grid = self.grids["cursores"] = Grid(
+            lambda k: self._pick("cursores", k), placeholder="Buscar cursores…",
+            empty=status_page("input-mouse-symbolic", "Nenhum cursor instalado", "Baixe cursores no Explorar.",
+                              "Explorar cursores", lambda: self._go_explore("cursors")))
         holder.append(grid)
-        add_batched(self.cursors.items(), lambda kv: grid.add(kv[0], cursor_preview(kv[1]), pretty(kv[0])),
-                    self.refresh_marks)
+        grid.set_loading(True)
+        add_batched(self.cursors.items(), lambda kv: grid.add(kv[0], cursor_preview(kv[1]), pretty(kv[0]),
+                                                                "Ponteiro, texto, link e carregando"),
+                    lambda: (grid.set_loading(False), self.refresh_marks()))
 
-    def _pick_cursor(self, name):
-        self._feedback("cursores", name, lambda: self.desk.apply_cursor(name),
-                       f"Cursor {pretty(name)} aplicado — alguns apps só mudam ao reabrir")
+    def _detail_cursores(self, key):
+        path = self.cursors.get(key)
+        if not path:
+            return None
+        imgs = [Gtk.Image(paintable=t, pixel_size=48) if t else None for t in cursor_textures(path, 48, 4)]
+        return dict(preview=labeled_samples(imgs, CURSOR_LABELS[:4], 48),
+                    caption="Imagens tiradas dos arquivos do cursor (a primeira imagem das animadas).",
+                    title=pretty(key), subtitle="Cursor", notes=limitations("cursor", self.env()),
+                    in_use=self.desk.current()["cursor"] == key)
 
-    # --- wallpapers
-    def _build_walls(self, holder):
-        choose = Gtk.Button(label="Escolher imagem…", css_classes=["suggested-action"])
+    def _build_wallpaper(self, holder):
+        choose = Gtk.Button(label="Escolher imagem…")
         choose.connect("clicked", self._choose_wall)
-        grid = self.grids["wallpaper"] = Grid(self._pick_wall, extra=choose)
+        self._page_header(holder, "wallpaper", choose)
+        grid = self.grids["wallpaper"] = Grid(
+            lambda k: self._pick("wallpaper", k), placeholder="Buscar papéis de parede…",
+            empty=status_page("preferences-desktop-wallpaper-symbolic", "Nenhuma imagem encontrada",
+                              "Escolha uma imagem do seu computador.", "Escolher imagem…",
+                              lambda: self._choose_wall(None)))
         holder.append(grid)
+        grid.set_loading(True)
 
         def add(path):
-            pic = picture(width_request=240, height_request=135, css_classes=["studio-thumb"],
+            pic = picture("contain", width_request=230, height_request=130, css_classes=["studio-thumb"],
                           overflow=Gtk.Overflow.HIDDEN)
             grid.add(str(path), pic, pretty(path.stem))
+            load_async(pic, path, 230, 130)
+        add_batched(list_wallpapers(), add, lambda: (grid.set_loading(False), self.refresh_marks()))
 
-            def work():
-                try:
-                    pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), 360, 202, True)
-                except GLib.Error:
-                    return
-                GLib.idle_add(lambda: pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb)) or False)
-            POOL.submit(work)
-        add_batched(list_wallpapers(), add, self.refresh_marks)
+    def _detail_wallpaper(self, key):
+        path = Path(key)
+        pic = picture("contain", width_request=340, height_request=200, css_classes=["studio-thumb"],
+                      overflow=Gtk.Overflow.HIDDEN)
+        load_async(pic, path, 340, 200)
+        zoom = Gtk.Button(label="Ver em tamanho maior", halign=Gtk.Align.START)
+        zoom.connect("clicked", lambda _b: self._zoom(path))
+        size = ""
+        try:
+            fmt, w, h = GdkPixbuf.Pixbuf.get_file_info(str(path))
+            size = f"{w} × {h} pixels" if fmt else ""
+        except (TypeError, GLib.Error):
+            pass
+        return dict(preview=pic, caption="A imagem inteira, sem cortes (na tela ela preenche o fundo).",
+                    title=pretty(path.stem), subtitle=size or str(path.parent), extra=zoom,
+                    notes=limitations("wallpaper", self.env()), in_use=self.desk.current()["wallpaper"] == key)
 
-    def _pick_wall(self, path):
-        self._feedback("wallpaper", str(path), lambda: self.desk.apply_wallpaper(path), "Wallpaper aplicado")
+    def _zoom(self, path):
+        win = Gtk.Window(transient_for=self, modal=True, title=pretty(Path(path).stem), default_width=1000,
+                         default_height=620)
+        pic = picture("contain", file=Gio.File.new_for_path(str(path)))
+        win.set_child(pic)
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda _c, k, *_: k == Gdk.KEY_Escape and (win.close() or True))
+        win.add_controller(keys)
+        win.present()
 
     def _choose_wall(self, _btn):
         filt = Gtk.FileFilter(name="Imagens")
         filt.add_pixbuf_formats()
+        pick = lambda path: self._pick("wallpaper", path)  # noqa: E731
         if hasattr(Gtk, "FileDialog"):
             filters = Gio.ListStore.new(Gtk.FileFilter)
             filters.append(filt)
-            dialog = Gtk.FileDialog(title="Escolher wallpaper", filters=filters)
+            dialog = Gtk.FileDialog(title="Escolher papel de parede", filters=filters)
 
             def done(d, res):
                 try:
                     f = d.open_finish(res)
                 except GLib.Error:
                     return
-                self._pick_wall(f.get_path())
+                pick(f.get_path())
             dialog.open(self, None, done)
         else:
-            self._chooser = Gtk.FileChooserNative(title="Escolher wallpaper", transient_for=self,
+            self._chooser = Gtk.FileChooserNative(title="Escolher papel de parede", transient_for=self,
                                                   action=Gtk.FileChooserAction.OPEN)
             self._chooser.add_filter(filt)
             self._chooser.connect("response", lambda d, r: r == Gtk.ResponseType.ACCEPT and
-                                  self._pick_wall(d.get_file().get_path()))
+                                  pick(d.get_file().get_path()))
             self._chooser.show()
 
-    # --- loja
-    def _build_store(self, holder):
-        if not self.store.items:
-            holder.append(Adw.StatusPage(icon_name="network-offline-symbolic", vexpand=True,
-                                         title="Carregando a loja…",
-                                         description="Se demorar, confira sua conexão com a internet."))
-            return
-        kinds = Gtk.Box(spacing=0, css_classes=["linked"])
-        first = None
-        for label, kind in (("Tudo", None), ("Temas", "gtk"), ("Ícones", "icons"), ("Cursores", "cursors")):
-            b = Gtk.ToggleButton(label=label, active=first is None)
-            if first:
-                b.set_group(first)
-            first = first or b
-            b.connect("toggled", lambda b, k=kind: b.get_active() and self.grids["loja"].filter_kind(k))
-            kinds.append(b)
-        everything = Gtk.Button(label="Instalar tudo", css_classes=["suggested-action"])
-        everything.connect("clicked", self._install_all)
-        extra = Gtk.Box(spacing=8)
-        extra.append(kinds)
-        extra.append(everything)
-        grid = self.grids["loja"] = Grid(self._pick_store, extra=extra)
-        holder.append(grid)
-        self.store_status = {}
-        order = {"gtk": 0, "icons": 1, "cursors": 2}
-        for item in sorted(self.store.items.values(), key=lambda i: (order[i["kind"]], i["title"].lower())):
-            pic = picture(width_request=240, height_request=135, css_classes=["studio-thumb"],
-                          overflow=Gtk.Overflow.HIDDEN)
-            pill = Gtk.Label(halign=Gtk.Align.START, margin_top=4, css_classes=["studio-pill"])
-            grid.add(item["id"], pic, item["title"],
-                     f"{KIND_LABEL[item['kind']]} · {mb(item['bytes'])} · {item['author']}", extra=pill,
-                     kind=item["kind"])
-            self.store_status[item["id"]] = pill
-            self.store.preview(item, lambda f, pic=pic: pic.set_paintable(thumb_texture(f, 240, 135)))
-        self._store_refresh()
+    # ------------------------------------------------------------ barra e dock (rascunho até aplicar)
+    def _reset_drafts(self):
+        if self.desk.bar:
+            self.bar_draft = self.desk.bar_read()
+            if hasattr(self, "bar_pos"):
+                self._bar_sync()
+        if getattr(self, "blur", None) and self.blur.root:
+            self.fx_draft = self.blur.read()
+            if hasattr(self, "fx_radius"):
+                self._fx_sync()
 
-    def _store_refresh(self):
-        for item_id, pill in getattr(self, "store_status", {}).items():
-            ok = self.store.is_installed(self.store.items[item_id])
-            pill.set_label("Instalado ✓" if ok else "Instalar")
-            (pill.add_css_class if ok else pill.remove_css_class)("ok")
+    def _preset_in_use(self, page):
+        if page == "barra" and self.desk.bar:
+            cur = self.desk.bar_read()
+            return next((n for n, p in BAR_PRESETS.items() if same(cur, p)), None)
+        if page == "efeitos" and getattr(self, "blur", None) and self.blur.root:
+            cur = self.blur.read()
+            return next((n for n, p in BLUR_PRESETS.items() if self._same_fx(cur, p)), None)
+        return None
 
-    def _pick_store(self, item_id):
-        item = self.store.items[item_id]
-        if self.store.is_installed(item):
-            confirm(self, f"Remover {item['title']}?",
-                    f"Ele some da aba {self.KIND_PAGE[item['kind']]}. Dá para instalar de novo quando quiser.",
-                    "Remover", lambda: (self.store.remove(item), self.rebuild(), self._store_refresh(),
-                                        self.toast(f"{item['title']} removido")))
-            return
-        self.grids["loja"].start(item_id)
-        self._download(self.store.with_needs([item]), f"Baixando {item['title']}…", lambda: (
-            self._store_refresh(), self.grids["loja"].finish(item_id),
-            self.toast(f"{item['title']} instalado — escolha na aba {self.KIND_PAGE[item['kind']]}")),
-            fail=lambda: self.grids["loja"].finish(item_id, ok=False))
+    def _preset_picked(self, page):
+        if page == "barra" and hasattr(self, "bar_draft"):
+            return next((n for n, p in BAR_PRESETS.items() if same(self.bar_draft, p)), None)
+        if page == "efeitos" and hasattr(self, "fx_draft"):
+            return next((n for n, p in BLUR_PRESETS.items() if self._same_fx(self.fx_draft, p)), None)
+        return None
 
-    def _install_all(self, _btn):
-        todo = [i for i in self.store.items.values() if not self.store.is_installed(i)]
-        if not todo:
-            self.toast("Tudo já está instalado")
-            return
-        confirm(self, "Instalar tudo?", f"São {len(todo)} pacotes, cerca de {mb(sum(i['bytes'] for i in todo))}.",
-                "Instalar", lambda: self._download(todo, "Baixando todos os pacotes…", lambda: (
-                    self._store_refresh(), self.toast("Tudo instalado"))))
+    @staticmethod
+    def _same_fx(cur, p):
+        if not p["parts"]:  # "Sem vidro": tudo desligado, a intensidade não importa
+            return not cur["parts"] and cur["windows"] == "nenhuma"
+        return set(cur["parts"]) >= set(p["parts"]) - {"panel"} and cur["windows"] == p["windows"] and \
+            abs(cur["radius"] - p["radius"]) < 1 and abs(cur["brightness"] - p["brightness"]) < .02
 
-    # --- barra
-    BAR_PRESETS = {
-        "Dock flutuante": dict(length=-1, margin=8, radius=3, size=52, custom=True, opacity=.85),
-        "Barra flutuante": dict(length=100, margin=8, radius=3, size=48, custom=True, opacity=.85),
-        "Barra clássica": dict(length=100, margin=0, radius=0, size=47, custom=False, opacity=.85),
-    }
-    POSITIONS = ["BOTTOM", "TOP", "LEFT", "RIGHT"]
-
-    def _build_bar(self, holder):
+    def _build_barra(self, holder):
+        self._page_header(holder, "barra")
         if not self.desk.bar:
-            holder.append(Adw.StatusPage(icon_name="view-continuous-symbolic", vexpand=True,
-                                         title="Barra de tarefas não encontrada",
-                                         description="Essa aba funciona com a barra do Zorin OS e com a extensão Dash to Panel."))
+            holder.append(status_page("view-continuous-symbolic", "Barra de tarefas não encontrada",
+                                      "Esta seção funciona com a barra do Zorin OS e com a extensão Dash to Panel. "
+                                      "Nenhuma das duas está instalada neste sistema."))
             return
-        page = Adw.PreferencesPage()
+        self.bar_draft = getattr(self, "bar_draft", None) or self.desk.bar_read()
+        page = Adw.PreferencesPage(vexpand=True)
         holder.append(page)
-
-        presets = Adw.PreferencesGroup(title="Estilos prontos",
-                                       description="Vale para todos os monitores conectados")
-        flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, max_children_per_line=3,
-                           column_spacing=14, row_spacing=14)
-        for name, p in self.BAR_PRESETS.items():
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            box.append(drawing(220, 110, lambda cr, w, h, p=p: self._draw_bar(cr, w, h, p)))
-            box.append(Gtk.Label(label=name, xalign=0, css_classes=["titulo"]))
-            btn = Gtk.Button(child=box, css_classes=["card", "studio-card"])
-            btn.connect("clicked", lambda _b, p=p, name=name: self._bar_preset(name, p))
-            flow.append(btn)
-        presets.add(flow)
+        presets = Adw.PreferencesGroup(title="Modelos", description="Escolha um ponto de partida e ajuste abaixo")
+        grid = self.grids["barra"] = Grid(self._bar_preset, search=False, scroll=False)
+        for name, p in BAR_PRESETS.items():
+            grid.add(name, drawing(200, 100, lambda cr, w, h, p=p: draw_bar(cr, w, h, dict(self.bar_draft, **p))),
+                     name)
+        presets.add(grid)
         page.add(presets)
 
-        fine = Adw.PreferencesGroup(title="Ajuste fino")
+        fine = Adw.PreferencesGroup(title="Ajustes", description="Valem para todos os monitores conectados")
         self._syncing = False
-        d = self.desk
-        self.bar_pos = Adw.ComboRow(title="Posição", model=Gtk.StringList.new(["Embaixo", "Em cima", "Esquerda", "Direita"]))
-        self.bar_pos.connect("notify::selected", lambda r, _p: self._bar_change(
-            lambda: d.bar_set("panel-positions", self.POSITIONS[r.get_selected()])))
+        self.bar_pos = Adw.ComboRow(title="Posição", model=Gtk.StringList.new([t for _k, t in BAR_POSITIONS]))
+        self.bar_pos.connect("notify::selected", lambda r, _p: self._bar_edit(
+            position=BAR_POSITIONS[r.get_selected()][0]))
         compact_row, self.bar_compact = switch_row(
-            "Barra compacta", "Só do tamanho dos ícones, centralizada. Desligada ocupa a tela inteira")
-        self.bar_compact.connect("notify::active", lambda s, _p: self._bar_change(
-            lambda: (d.bar_set("panel-lengths", -1 if s.get_active() else 100), d.bar_set("panel-anchors", "MIDDLE"))))
-        size_row, self.bar_size = spin_row("Altura", 24, 96)
-        self.bar_size.connect("value-changed", lambda s: self._bar_change(
-            lambda: d.bar_set("panel-sizes", s.get_value_as_int())))
-        margin_row, self.bar_margin = spin_row("Distância da borda", 0, 32)
-        self.bar_margin.connect("value-changed", lambda s: self._bar_change(
-            lambda: d.bar_set_plain("panel-margin", s.get_value_as_int())))
-        radius_row, self.bar_radius = spin_row("Arredondamento", 0, 5, "Cada nível arredonda 5px")
-        self.bar_radius.connect("value-changed", lambda s: self._bar_change(
-            lambda: d.bar_set_plain("global-border-radius", s.get_value_as_int())))
-        custom_row, self.bar_custom = switch_row("Transparência personalizada")
-        self.bar_custom.connect("notify::active", lambda s, _p: self._bar_change(
-            lambda: d.bar_set_plain("trans-use-custom-opacity", s.get_active())))
-        self.bar_opacity = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
-        self.bar_opacity.set_size_request(220, -1)
-        self.bar_opacity.set_valign(Gtk.Align.CENTER)
-        self.bar_opacity.connect("value-changed", lambda s: self._bar_change(
-            lambda: d.bar_set_plain("trans-panel-opacity", s.get_value() / 100)))
-        opacity_row = Adw.ActionRow(title="Opacidade")
-        opacity_row.add_suffix(self.bar_opacity)
+            "Barra compacta", "Só do tamanho dos ícones, centralizada. Desligada, ocupa a borda inteira")
+        self.bar_compact.connect("notify::active", lambda s, _p: self._bar_edit(length=-1 if s.get_active() else 100))
+        size_row, self.bar_size = spin_row("Altura", 24, 96, "Espessura da barra", "px")
+        self.bar_size.connect("value-changed", lambda s: self._bar_edit(size=s.get_value_as_int()))
+        margin_row, self.bar_margin = spin_row("Distância da borda", 0, 32, "Espaço entre a barra e a borda da tela",
+                                               "px")
+        self.bar_margin.connect("value-changed", lambda s: self._bar_edit(margin=s.get_value_as_int()))
+        radius_row, self.bar_radius = spin_row("Arredondamento dos cantos", 0, 25, "Em passos de 5 px", "px", 5)
+        self.bar_radius.connect("value-changed", lambda s: self._bar_edit(radius=round(s.get_value() / 5)))
+        custom_row, self.bar_custom = switch_row("Transparência própria", "Desligada, segue o tema")
+        self.bar_custom.connect("notify::active", lambda s, _p: self._bar_edit(custom=s.get_active()))
+        opacity_row, self.bar_opacity = scale_row("Opacidade", 0, 100, "100 % é totalmente opaca")
+        self.bar_opacity.connect("value-changed", lambda s: self._bar_edit(opacity=round(s.get_value() / 100, 2)))
         self.bar_custom.bind_property("active", opacity_row, "sensitive", GObject.BindingFlags.SYNC_CREATE)
         hide_row, self.bar_hide = switch_row("Esconder automaticamente", "Some quando uma janela encosta nela")
-        self.bar_hide.connect("notify::active", lambda s, _p: self._bar_change(
-            lambda: d.bar_set_plain("intellihide", s.get_active())))
+        self.bar_hide.connect("notify::active", lambda s, _p: self._bar_edit(hide=s.get_active()))
         for row in (self.bar_pos, compact_row, size_row, margin_row, radius_row, custom_row, opacity_row, hide_row):
             fine.add(row)
         page.add(fine)
         self._bar_sync()
 
-    @staticmethod
-    def _draw_bar(cr, w, h, p):
-        draw_backdrop(cr, w, h, WALL_PALETTES["catppuccin"])
-        m = p["margin"] * .9
-        bh = 16
-        bw = w * .5 if p["length"] == -1 else w - 2 * m
-        x, y = (w - bw) / 2, h - bh - m
-        _src(cr, rgba("#181825"), p["opacity"] if p["custom"] else 1)
-        _rr(cr, x, y, bw, bh, min(p["radius"] * 3, bh / 2) or .1)
-        cr.fill()
-        icons = 6
-        for i in range(icons):
-            _src(cr, rgba(["#cba6f7", "#89b4fa", "#a6e3a1", "#f9e2af", "#fab387", "#f38ba8"][i]))
-            cr.arc(w / 2 + (i - (icons - 1) / 2) * 13, y + bh / 2, 4, 0, 2 * pi)
-            cr.fill()
+    def _bar_edit(self, **values):
+        if self._syncing:
+            return
+        self.bar_draft.update(values)
+        self._bar_pending()
 
-    def _bar_change(self, fn):
-        if not self._syncing:
-            fn()
-
-    def _bar_preset(self, name, p):
-        d = self.desk
-        d.bar_set("panel-lengths", p["length"])
-        d.bar_set("panel-anchors", "MIDDLE")
-        d.bar_set("panel-sizes", p["size"])
-        d.bar_set_plain("panel-margin", p["margin"])
-        d.bar_set_plain("global-border-radius", p["radius"])
-        d.bar_set_plain("trans-use-custom-opacity", p["custom"])
-        d.bar_set_plain("trans-panel-opacity", p["opacity"])
+    def _bar_preset(self, name):
+        self.bar_draft.update(BAR_PRESETS[name])
         self._bar_sync()
-        self.toast(f"{name} aplicado em todos os monitores")
+        self._bar_pending()
+
+    def _bar_pending(self):
+        """O rascunho vira uma alteração pendente; igual ao sistema, sai da seleção."""
+        if same(self.desk.bar_read(), self.bar_draft):
+            self.sel.remove("barra")
+        else:
+            d = dict(self.bar_draft)
+            label = next((n for n, p in BAR_PRESETS.items() if same(d, p)), "Ajustes próprios")
+            self.sel.set(Change("barra", d, f"{label} · {d['size']} px", lambda: self.desk.bar_write(d),
+                                source=("barra", None)))
+        self.detail_for = ("barra", None)
+        if self.grids.get("barra"):
+            self.grids["barra"].flow.queue_draw()
+            for btn in self.grids["barra"].cards.values():
+                btn.queue_draw()
+        self._selection_changed()
 
     def _bar_sync(self):
-        d, b = self.desk, self.desk.bar
+        d = self.bar_draft
         self._syncing = True
-        pos = d.bar_get("panel-positions", "BOTTOM")
-        self.bar_pos.set_selected(self.POSITIONS.index(pos) if pos in self.POSITIONS else 0)
-        self.bar_compact.set_active(d.bar_get("panel-lengths", 100) == -1)
-        self.bar_size.set_value(d.bar_get("panel-sizes", 48))
-        self.bar_margin.set_value(b.get_int("panel-margin") if has_key(b, "panel-margin") else 0)
-        self.bar_radius.set_value(b.get_int("global-border-radius") if has_key(b, "global-border-radius") else 0)
-        self.bar_custom.set_active(has_key(b, "trans-use-custom-opacity") and b.get_boolean("trans-use-custom-opacity"))
-        self.bar_opacity.set_value(b.get_double("trans-panel-opacity") * 100 if has_key(b, "trans-panel-opacity") else 100)
-        self.bar_hide.set_active(has_key(b, "intellihide") and b.get_boolean("intellihide"))
+        keys = [k for k, _t in BAR_POSITIONS]
+        self.bar_pos.set_selected(keys.index(d["position"]) if d["position"] in keys else 0)
+        self.bar_compact.set_active(d["length"] == -1)
+        self.bar_size.set_value(d["size"])
+        self.bar_margin.set_value(d["margin"])
+        self.bar_radius.set_value(d["radius"] * 5)
+        self.bar_custom.set_active(d["custom"])
+        self.bar_opacity.set_value(d["opacity"] * 100)
+        self.bar_hide.set_active(d["hide"])
         self._syncing = False
 
-    # --- efeitos (vidro)
+    def _detail_barra(self, _key):
+        if not self.desk.bar:
+            return None
+        d = self.bar_draft
+        pos = dict(BAR_POSITIONS).get(d["position"], d["position"]).lower()
+        return dict(preview=drawing(340, 190, lambda cr, w, h: draw_bar(cr, w, h, self.bar_draft)),
+                    caption="Ilustração: mostra a posição e o formato, não a sua barra de verdade.",
+                    title="Barra " + ("compacta" if d["length"] == -1 else "inteira"),
+                    subtitle=f"{pos} · {d['size']} px de altura · {d['margin']} px da borda · cantos de "
+                             f"{d['radius'] * 5} px",
+                    notes=limitations("barra", self.env()), in_use=same(self.desk.bar_read(), d))
+
+    # ------------------------------------------------------------ efeitos (rascunho até aplicar)
     def _is_zorin(self):
         return self.desk.bar is not None and "zorin" in self.desk.bar.props.schema_id
 
-    def _build_effects(self, holder):
+    def _build_efeitos(self, holder):
+        self._page_header(holder, "efeitos")
         blur = self.blur = Blur()
         if not Blur.installed() or not blur.root:
-            status = Adw.StatusPage(
-                icon_name="weather-fog-symbolic", vexpand=True, title="Efeito de vidro",
-                description="Deixa menus, telas e janelas com aparência de vidro fosco. Usa a extensão gratuita "
-                            "Blur my Shell: o sistema vai perguntar se você quer instalar, é só confirmar.")
+            status = status_page("weather-fog-symbolic", "Efeito de vidro não instalado",
+                                 "Deixa menus, telas e janelas com aparência de vidro fosco. Usa a extensão "
+                                 "gratuita Blur my Shell, do extensions.gnome.org: o GNOME vai perguntar se você "
+                                 "quer instalar. Instalar não liga nada sozinho.")
             btn = Gtk.Button(label="Instalar efeito de vidro", css_classes=["suggested-action", "pill"],
                              halign=Gtk.Align.CENTER)
             btn.connect("clicked", self._install_blur)
@@ -1996,91 +3570,119 @@ class Window(Adw.ApplicationWindow):
         enable_extension(BLUR_UUID)
         zorin = self._is_zorin()
         blur.adapt(zorin)
-        page = Adw.PreferencesPage()
+        self.fx_draft = getattr(self, "fx_draft", None) or blur.read()
+        page = Adw.PreferencesPage(vexpand=True)
         holder.append(page)
+        if not animations_enabled():
+            note = Adw.PreferencesGroup()
+            note.add(Adw.ActionRow(title="Animações do sistema desligadas",
+                                   subtitle="O vidro é estático e continua disponível. O Adon Studio também não "
+                                            "anima nada enquanto essa preferência estiver ligada."))
+            page.add(note)
 
-        presets = Adw.PreferencesGroup(title="Estilos prontos")
-        grid = self.grids["efeitos"] = Grid(self._pick_effect, search=False, scroll=False)
+        presets = Adw.PreferencesGroup(title="Modelos")
+        grid = self.grids["efeitos"] = Grid(self._fx_preset, search=False, scroll=False)
         for name, p in BLUR_PRESETS.items():
-            grid.add(name, drawing(220, 120, lambda cr, w, h, p=p: self._draw_glass(cr, w, h, p)), name)
+            grid.add(name, drawing(200, 110, lambda cr, w, h, p=p: draw_glass(cr, w, h, p)), name)
         presets.add(grid)
         page.add(presets)
 
         self._fx_syncing = False
-        where = Adw.PreferencesGroup(title="Onde aplicar")
+        where = Adw.PreferencesGroup(title="Onde aplicar", description="Cada opção vale só para o lugar descrito")
         self.fx_switch = {}
+        explain = {"appfolder": "Fundo das pastas na tela de aplicativos",
+                   "lockscreen": "Fundo da tela que pede a senha"}
         for part, title, sub in BLUR_PARTS:
             if part not in blur.parts:
                 continue
+            sub = sub or explain.get(part)
             if part == "panel" and zorin:
-                sub = "No Zorin a barra de tarefas é outra; o vidro nela chega numa próxima versão"
+                sub = "No Zorin a barra de tarefas é outra; o vidro nela ainda não é suportado"
             row, sw = switch_row(title, sub)
             row.set_sensitive(not (part == "panel" and zorin))
-            sw.connect("notify::active", lambda s, _p, part=part: self._fx_change(lambda: blur.set(part, s.get_active())))
+            sw.connect("notify::active", lambda s, _p, part=part: self._fx_edit(part=(part, s.get_active())))
             self.fx_switch[part] = sw
             where.add(row)
         self.fx_windows = Adw.ComboRow(title="Vidro nas janelas",
-                                       subtitle="O modo de todas as janelas pesa na placa de vídeo",
+                                       subtitle="Deixa ver o fundo através das janelas. "
+                                                "“Todas as janelas” pesa na placa de vídeo",
                                        model=Gtk.StringList.new([label for _m, label in WINDOW_MODES]))
-        self.fx_windows.connect("notify::selected", lambda r, _p: self._fx_change(
-            lambda: (blur.set_windows(WINDOW_MODES[r.get_selected()][0]), self._fx_sync())))
+        self.fx_windows.connect("notify::selected", lambda r, _p: self._fx_edit(
+            windows=WINDOW_MODES[r.get_selected()][0]))
         where.add(self.fx_windows)
         page.add(where)
 
         strength = Adw.PreferencesGroup(title="Intensidade")
-        self.fx_radius = self._fx_scale(strength, "Desfoque", 0, 100)
-        self.fx_bright = self._fx_scale(strength, "Brilho", 30, 100)
-        self.fx_opacity = self._fx_scale(strength, "Opacidade das janelas", 50, 100)
+        row, self.fx_radius = scale_row("Desfoque", 0, 100, "Quanto o fundo fica borrado")
+        strength.add(row)
+        row, self.fx_bright = scale_row("Brilho", 30, 100, "Quanto mais baixo, mais escuro o vidro")
+        strength.add(row)
+        row, self.fx_opacity = scale_row("Opacidade das janelas", 50, 100,
+                                         "Só vale com o vidro nas janelas ligado")
+        strength.add(row)
         page.add(strength)
-        for sc in (self.fx_radius, self.fx_bright):
-            sc.connect("value-changed", lambda _s: self._fx_change(self._fx_save_strength))
-        self.fx_opacity.connect("value-changed", lambda s: self._fx_change(
-            lambda: blur.parts["applications"].set_int("opacity", int(s.get_value() * 2.55))))
+        self.fx_radius.connect("value-changed", lambda s: self._fx_edit(radius=round(s.get_value() * .6)))
+        self.fx_bright.connect("value-changed", lambda s: self._fx_edit(brightness=round(s.get_value() / 100, 2)))
+        self.fx_opacity.connect("value-changed", lambda s: self._fx_edit(opacity=int(s.get_value() * 2.55)))
         self._fx_sync()
 
-    def _fx_scale(self, group, title, lo, hi):
-        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, 1)
-        scale.set_size_request(260, -1)
-        scale.set_valign(Gtk.Align.CENTER)
-        row = Adw.ActionRow(title=title)
-        row.add_suffix(scale)
-        group.add(row)
-        scale.row = row
-        return scale
+    def _fx_edit(self, part=None, **values):
+        if self._fx_syncing:
+            return
+        d = self.fx_draft
+        if part:
+            name, on = part
+            d["parts"] = [p for p in d["parts"] if p != name] + ([name] if on else [])
+        d.update(values)
+        self.fx_opacity.row.set_sensitive(d["windows"] != "nenhuma")
+        self._fx_pending()
 
-    def _fx_change(self, fn):
-        if not self._fx_syncing:
-            fn()
+    def _fx_preset(self, name):
+        p = BLUR_PRESETS[name]
+        self.fx_draft.update(parts=list(p["parts"]), windows=p["windows"], radius=p["radius"],
+                             brightness=p["brightness"])
+        if self._is_zorin():
+            self.fx_draft["parts"] = [x for x in self.fx_draft["parts"] if x != "panel"]
+        self._fx_sync()
+        self._fx_pending()
 
-    def _fx_save_strength(self):
-        # a extensão redesenha a cada gravação: espera o controle parar de mexer
-        if getattr(self, "_fx_timer", None):
-            GLib.source_remove(self._fx_timer)
-
-        def save():
-            self._fx_timer = None
-            self.blur.set_strength(self.fx_radius.get_value() * 0.6, self.fx_bright.get_value() / 100)
-            return False
-        self._fx_timer = GLib.timeout_add(250, save)
+    def _fx_pending(self):
+        cur, d = self.blur.read(), dict(self.fx_draft)
+        if set(cur["parts"]) == set(d["parts"]) and same(cur, {k: v for k, v in d.items() if k != "parts"}):
+            self.sel.remove("efeitos")
+        else:
+            label = next((n for n, p in BLUR_PRESETS.items() if self._same_fx(d, p)), "Ajustes próprios")
+            self.sel.set(Change("efeitos", d, label, lambda: self.blur.write(d, self._is_zorin()),
+                                source=("efeitos", None)))
+        self.detail_for = ("efeitos", None)
+        self._selection_changed()
 
     def _fx_sync(self):
-        b = self.blur
+        d = self.fx_draft
         self._fx_syncing = True
         for part, sw in self.fx_switch.items():
-            sw.set_active(b.get(part))
-        mode = b.windows()
-        self.fx_windows.set_selected(next(i for i, (m, _l) in enumerate(WINDOW_MODES) if m == mode))
-        radius, bright = b.strength()
-        self.fx_radius.set_value(radius / 0.6)
-        self.fx_bright.set_value(bright * 100)
-        apps = b.parts.get("applications")
-        self.fx_opacity.set_value(apps.get_int("opacity") / 2.55 if apps else 85)
-        self.fx_opacity.row.set_sensitive(mode != "nenhuma")
+            sw.set_active(part in d["parts"])
+        self.fx_windows.set_selected(next(i for i, (m, _l) in enumerate(WINDOW_MODES) if m == d["windows"]))
+        self.fx_radius.set_value(d["radius"] / .6)
+        self.fx_bright.set_value(d["brightness"] * 100)
+        self.fx_opacity.set_value(d["opacity"] / 2.55)
+        self.fx_opacity.row.set_sensitive(d["windows"] != "nenhuma")
         self._fx_syncing = False
 
-    def _pick_effect(self, name):
-        self._feedback("efeitos", name, lambda: (self.blur.apply_preset(BLUR_PRESETS[name], self._is_zorin()),
-                                                 self._fx_sync()), f"{name} aplicado")
+    def _detail_efeitos(self, _key):
+        if not getattr(self, "fx_draft", None):
+            return None
+        d = self.fx_draft
+        names = [t for p, t, _s in BLUR_PARTS if p in d["parts"]]
+        return dict(preview=drawing(340, 190, lambda cr, w, h: draw_glass(cr, w, h, self.fx_draft)),
+                    caption="Ilustração: o vidro real depende do que está atrás de cada parte.",
+                    title="Vidro " + ("ligado" if names or d["windows"] != "nenhuma" else "desligado"),
+                    subtitle=(human_list(names) if names else "Nenhuma parte do sistema") + " · janelas: " +
+                    dict(WINDOW_MODES)[d["windows"]].lower(),
+                    notes=limitations("efeitos", self.env()), in_use=self._fx_pending_is_empty())
+
+    def _fx_pending_is_empty(self):
+        return "efeitos" not in self.sel.changes
 
     def _install_blur(self, btn):
         btn.set_sensitive(False)
@@ -2090,48 +3692,392 @@ class Window(Adw.ApplicationWindow):
             if result == "ok":
                 Blur().adapt(self._is_zorin())
                 self.rebuild("efeitos")
-                self.toast("Efeito de vidro instalado")
+                self.toast("Efeito de vidro instalado. Escolha um modelo e clique em Aplicar")
             else:
                 btn.set_sensitive(True)
                 btn.set_label("Instalar efeito de vidro")
                 self.toast("Instalação cancelada" if result == "cancelled" else f"Não deu para instalar: {result}")
         Blur.install(done)
 
-    @staticmethod
-    def _draw_glass(cr, w, h, p):
-        draw_backdrop(cr, w, h, WALL_PALETTES["neon"])
-        glass = bool(p["parts"])
-        strength = p["radius"] / 50 if glass else 0
-        x, y, gw, gh = w * .14, h * .18, w * .72, h * .64
-        _src(cr, rgba("#ffffff") if glass else rgba("#1e1e2e"), .10 + .12 * strength if glass else 1)
-        _rr(cr, x, y, gw, gh, 12)
-        cr.fill_preserve()
-        _src(cr, rgba("#ffffff"), .35 if glass else .08)
-        cr.set_line_width(1.2)
-        cr.stroke()
-        for i, frac in enumerate((.6, .4, .5)):
-            _src(cr, rgba("#ffffff"), .75 if i == 0 else .4)
-            _rr(cr, x + 14, y + 16 + i * 14, (gw - 28) * frac, 7, 3.5)
-            cr.fill()
+    # ------------------------------------------------------------ explorar (instalar ≠ aplicar)
+    def _build_explorar(self, holder):
+        if not self.store.items:
+            self._page_header(holder, "explorar")
+            if self.store_loading:
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, vexpand=True,
+                              valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+                sp = Spinner(32)
+                sp.start()
+                box.append(sp)
+                box.append(Gtk.Label(label="Carregando o catálogo…", css_classes=["dim-label"]))
+                holder.append(box)
+            else:
+                holder.append(status_page("network-offline-symbolic", "Não deu para carregar o catálogo",
+                                          "Confira sua conexão com a internet. Os temas que você já tem continuam "
+                                          "nas outras seções.", "Tentar de novo", self._retry_catalog))
+            return
+        self.install_btn = Gtk.Button(label="Instalar marcados", css_classes=["suggested-action"], sensitive=False)
+        self.install_btn.connect("clicked", lambda _b: self._install_marked())
+        self._page_header(holder, "explorar", self.install_btn)
+        if self.store.offline:
+            holder.append(Gtk.Label(label="Sem conexão: mostrando a última cópia do catálogo. Downloads podem "
+                                          "falhar.", wrap=True, xalign=0, css_classes=["card", "studio-notice"]))
+        filters = [("Tudo", None), ("Não instalados", "novo"), ("Instalados", "instalado")]
+        kinds = Gtk.Box(css_classes=["linked"])
+        first = None
+        for label, kind in (("Todos os tipos", None), ("Temas", "gtk"), ("Ícones", "icons"), ("Cursores", "cursors")):
+            b = Gtk.ToggleButton(label=label, active=first is None)
+            if first:
+                b.set_group(first)
+            first = first or b
+            b.connect("toggled", lambda b, k=kind: b.get_active() and self.grids["explorar"].filter_kind(k))
+            kinds.append(b)
+        grid = self.grids["explorar"] = Grid(lambda k: self._show_item(k), extra=kinds, filters=filters,
+                                             placeholder="Buscar no catálogo…")
+        holder.append(grid)
+        self.store_status, self.marked = {}, {}
+        order = {"gtk": 0, "icons": 1, "cursors": 2}
+        for item in sorted(self.store.items.values(), key=lambda i: (order[i["kind"]], i["title"].lower())):
+            pic = picture(width_request=230, height_request=130, css_classes=["studio-thumb"],
+                          overflow=Gtk.Overflow.HIDDEN)
+            # marcador até a miniatura chegar (ou se ela não vier)
+            thumb = Gtk.Overlay(child=Gtk.Image(icon_name=KIND_ICON[item["kind"]], pixel_size=32,
+                                                width_request=230, height_request=130, css_classes=["dim-label"]))
+            thumb.add_overlay(pic)
+            pill = Gtk.Label(halign=Gtk.Align.START, margin_top=2, css_classes=["studio-pill"])
+            mark = Gtk.CheckButton(label="Marcar para instalar", margin_start=6)
+            mark.connect("toggled", lambda _b: self._marked_changed())
+            grid.add(item["id"], thumb, item["title"],
+                     f"{KIND_LABEL[item['kind']]} · {mb(item['bytes'])} · {item['author']}", extra=pill,
+                     kind=item["kind"], below=mark)
+            self.store_status[item["id"]] = pill
+            self.marked[item["id"]] = mark
+            self.store.preview(item, lambda f, pic=pic: pic.set_paintable(thumb_texture(f, 230, 130)))
+        self._store_refresh()
 
-    # --- restaurar / sobre
-    def _ask_restore(self, _btn):
+    def _store_refresh(self):
+        grid = self.grids.get("explorar")
+        for item_id, pill in getattr(self, "store_status", {}).items():
+            ok = self.store.is_installed(self.store.items[item_id])
+            err = self.store.failed.get(item_id)
+            pill.set_label("Instalado ✓" if ok else "Falhou ✗" if err else "Não instalado")
+            for cls, on in (("ok", ok), ("erro", bool(err) and not ok)):
+                (pill.add_css_class if on else pill.remove_css_class)(cls)
+            mark = self.marked[item_id]
+            mark.set_visible(not ok)
+            if ok:
+                mark.set_active(False)
+            if grid and item_id in grid.cards:
+                grid.cards[item_id].tags = {"instalado" if ok else "novo"}
+        if grid:
+            grid.flow.invalidate_filter()
+        self._marked_changed()
+
+    def _marked_changed(self):
+        ids = [i for i, m in getattr(self, "marked", {}).items() if m.get_active()]
+        if hasattr(self, "install_btn"):
+            size = sum(self.store.items[i]["bytes"] for i in ids)
+            self.install_btn.set_label(f"Instalar marcados ({len(ids)} · {mb(size)})" if ids else "Instalar marcados")
+            self.install_btn.set_sensitive(bool(ids) and not self.busy)
+
+    def _show_item(self, item_id):
+        self.detail_for = ("explorar", item_id)
+        self._render_detail()
+        self._open_detail()
+
+    def _install(self, ids):
+        items = self.store.with_needs([self.store.items[i] for i in ids])
+        grid = self.grids.get("explorar")
+        if grid and len(ids) == 1:
+            grid.start(ids[0])
+        label = f"Baixando {items[0]['title']}…" if len(items) == 1 else f"Baixando {len(items)} pacotes…"
+
+        def done(err):
+            self._store_refresh()
+            grid = self.grids.get("explorar")
+            for i in ids:
+                if grid:
+                    grid.finish(i, ok=i not in self.store.failed)
+            ok = [self.store.items[i]["title"] for i in ids if i not in self.store.failed]
+            if err:
+                inform(self, "Alguns pacotes não foram instalados" if ok else "Nada foi instalado",
+                       (f"Instalado: {human_list(ok)}.\n" if ok else "") + f"Falhou — {err}.")
+            else:
+                self.toast(f"Instalado: {human_list(ok)}. Para usar, escolha na seção e clique em Aplicar")
+            self._render_detail()
+        if not self._download(items, label, done) and grid and len(ids) == 1:
+            grid.finish(ids[0], ok=False)
+        self._render_detail()
+
+    def _install_marked(self):
+        ids = [i for i, m in self.marked.items() if m.get_active()]
+        if ids:
+            self._install(ids)
+
+    def _remove_item(self, item):
+        def go():
+            self.store.remove(item)
+            self.rebuild()
+            self._store_refresh()
+            self.toast(f"{item['title']} removido")
+        confirm(self, f"Remover {item['title']}?",
+                f"Ele some da seção {self.PAGE[self.KIND_PAGE[item['kind']]][1]}. Se estiver em uso, o sistema "
+                "volta para o padrão desse item. Dá para instalar de novo quando quiser.", "Remover", go,
+                destructive=True)
+
+    def _use_item(self, item):
+        page = self.KIND_PAGE[item["kind"]]
+        self.go(page)
+        grid = self.grids.get(page)
+        if grid:
+            grid.set_query(item["title"].split()[0].lower())
+
+    def _detail_explorar(self, key):
+        item = self.store.items.get(key)
+        if not item:
+            return None
+        pic = picture("contain", width_request=340, height_request=190, css_classes=["studio-thumb"],
+                      overflow=Gtk.Overflow.HIDDEN)
+        self.store.preview(item, lambda f: pic.set_paintable(thumb_texture(f, 340, 190)))
+        installed = self.store.is_installed(item)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for label, value in (("Autor", item.get("author", "—")), ("Licença", item.get("license", "—")),
+                             ("Tamanho", mb(item["bytes"])), ("Instala em", str(STORE_DIRS[item["kind"]]).replace(
+                                 str(HOME), "~"))):
+            line = Gtk.Box(spacing=8)
+            line.append(Gtk.Label(label=label, xalign=0, hexpand=True, css_classes=["dim-label"]))
+            line.append(Gtk.Label(label=value, xalign=1, wrap=True, selectable=True))
+            box.append(line)
+        if item.get("source"):
+            box.append(Gtk.LinkButton(uri=item["source"], label="Ver a origem do pacote", halign=Gtk.Align.START))
+        actions = Gtk.Box(spacing=8, margin_top=6)
+        if installed:
+            use = Gtk.Button(label=f"Escolher em {self.PAGE[self.KIND_PAGE[item['kind']]][1]}",
+                             css_classes=["suggested-action"])
+            use.connect("clicked", lambda _b: self._use_item(item))
+            actions.append(use)
+            rm = Gtk.Button(label="Remover", css_classes=["destructive-action"])
+            rm.connect("clicked", lambda _b: self._remove_item(item))
+            actions.append(rm)
+        else:
+            inst = Gtk.Button(label="Baixando…" if self.busy else f"Instalar ({mb(item['bytes'])})",
+                              css_classes=["suggested-action"], sensitive=not self.busy)
+            inst.connect("clicked", lambda _b: self._install([key]))
+            actions.append(inst)
+        box.append(actions)
+        notes = ["Instalar só baixa para a sua pasta pessoal. Nada muda no visual até você escolher o item e "
+                 "clicar em Aplicar."]
+        err = self.store.failed.get(key)
+        return dict(preview=pic, caption="Imagem gerada a partir do pacote.", title=item["title"],
+                    subtitle=f"{KIND_LABEL[item['kind']]} · {'instalado' if installed else 'não instalado'}",
+                    extra=box, notes=notes, error=f"A última tentativa falhou: {err}" if err and not installed
+                    else None, state="Instalado" if installed else "Não instalado")
+
+    # ------------------------------------------------------------ meus estilos
+    def _build_meus(self, holder):
+        save = Gtk.Button(label="Salvar visual atual…")
+        save.connect("clicked", lambda _b: self._save_current())
+        self._page_header(holder, "meus", save)
+        grid = self.grids["meus"] = Grid(
+            lambda k: self._pick("meus", k), placeholder="Buscar nos meus estilos…",
+            empty=status_page("user-bookmarks-symbolic", "Nenhum estilo salvo",
+                              "Aplique um visual de que você goste e salve aqui para voltar a ele depois.",
+                              "Salvar visual atual…", self._save_current))
+        holder.append(grid)
+        for st in load_styles():
+            grid.add(st["name"], self._style_preview(st, 250, 140), st["name"],
+                     " · ".join(pretty(st[k]) for k in ("gtk", "icons") if st.get(k)))
+        grid.set_loading(False)
+
+    def _style_preview(self, st, w, h):
+        theme = self.themes.get(st.get("gtk"))
+        pal = theme_palette(theme) if theme else tuple(map(rgba, ("#2b2b2b", "#242424", "#eeeeee", "#3584e4")))
+        return desktop_preview(st.get("wallpaper"), pal, st.get("icons") if st.get("icons") in self.icons else None,
+                               w, h)
+
+    def _save_current(self):
+        cur = self.desk.current()
+
+        def save(name):
+            save_style(dict(name=name, gtk=cur["gtk"], icons=cur["icons"], cursor=cur["cursor"],
+                            wallpaper=cur["wallpaper"]))
+            self.rebuild("meus")
+            self.toast(f"Estilo “{name}” salvo")
+        body = (f"Guarda o tema {pretty(cur['gtk'])}, os ícones, o cursor e o papel de parede que estão em uso. "
+                "A barra e o vidro não entram no estilo.")
+        if cur["icons"].startswith(FOLDER_PREFIX):
+            body += " As cores de uma paleta da seção Cores não são guardadas."
+        ask_text(self, "Salvar visual atual", body, "Salvar", self._current_name(), save)
+
+    def _detail_meus(self, key):
+        st = next((s for s in load_styles() if s["name"] == key), None)
+        if not st:
+            return None
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        missing = []
+        for label, field, have in (("Tema", "gtk", self.themes), ("Ícones", "icons", self.icons),
+                                   ("Cursor", "cursor", self.cursors)):
+            line = Gtk.Box(spacing=8)
+            line.append(Gtk.Label(label=label, xalign=0, hexpand=True, css_classes=["dim-label"]))
+            ok = st.get(field) in have
+            line.append(Gtk.Label(label=pretty(st.get(field) or "—") + ("" if ok else " (não instalado)"),
+                                  xalign=1, wrap=True))
+            info.append(line)
+            if not ok:
+                missing.append(label)
+        if not (st.get("wallpaper") and Path(st["wallpaper"]).exists()):
+            missing.append("Papel de parede")
+        rm = Gtk.Button(label="Excluir estilo", css_classes=["destructive-action"], halign=Gtk.Align.START,
+                        margin_top=6)
+        rm.connect("clicked", lambda _b: confirm(self, f"Excluir “{key}”?", "Só apaga o estilo salvo; não muda "
+                                                 "nada no visual nem desinstala temas.", "Excluir",
+                                                 lambda: self._delete_style(key), destructive=True))
+        info.append(rm)
+        notes = [f"Não está mais neste computador e fica de fora: {human_list(missing)}."] if missing else []
+        return dict(preview=self._style_preview(st, 340, 190), caption=ILLUSTRATIVE, title=key,
+                    subtitle="Estilo salvo", extra=info, notes=notes, in_use=self._my_style_in_use() == key)
+
+    def _delete_style(self, name):
+        delete_style(name)
+        for k, c in list(self.sel.changes.items()):
+            if c.source == ("meus", name):
+                self.sel.remove(k)
+        self.rebuild("meus")
+        self.detail_for = ("meus", None)
+        self._selection_changed()
+
+    # ------------------------------------------------------------ painel de prévia e detalhes
+    def env(self):
+        return environment(self.desk, self.user_theme)
+
+    def _render_detail(self):
+        while child := self.detail.get_first_child():
+            self.detail.remove(child)
+        page, key = self.detail_for or (self.page, None)
+        info = None
+        if key is not None or page in ("barra", "efeitos"):
+            builder = getattr(self, f"_detail_{page}", None)
+            info = builder(key) if builder else None
+        d = self.detail
+        head = Gtk.Box(spacing=10)
+        head.append(Gtk.Label(label="Prévia", xalign=0, css_classes=["title-2"]))
+        if info:
+            selected = (page, key) in [c.source for c in self.sel.changes.values()]
+            if info.get("state"):
+                state, cls = info["state"], "em-uso" if info["state"] == "Instalado" else None
+            elif selected:
+                state, cls = "Selecionado · não aplicado", "selecionado"
+            elif info.get("in_use"):
+                state, cls = "Em uso", "em-uso"
+            else:
+                state, cls = "Não selecionado", None
+            head.append(Gtk.Label(label=state, valign=Gtk.Align.CENTER,
+                                  css_classes=["studio-badge"] + ([cls] if cls else [])))
+        d.append(head)
+        if not info:
+            empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=24, margin_bottom=24)
+            empty.append(Gtk.Image(icon_name=self.PAGE[page][3], pixel_size=48, css_classes=["dim-label"]))
+            empty.append(Gtk.Label(label="Escolha um item", css_classes=["title-3"]))
+            empty.append(Gtk.Label(label="Clique num cartão para ver a prévia aqui. Nada muda no sistema até você "
+                                         "clicar em Aplicar.", wrap=True, justify=Gtk.Justification.CENTER,
+                                   css_classes=["dim-label"]))
+            d.append(empty)
+        else:
+            preview = info["preview"]
+            preview.set_halign(Gtk.Align.CENTER)
+            d.append(preview)
+            if info.get("caption"):
+                d.append(Gtk.Label(label=info["caption"], xalign=0, wrap=True, css_classes=["caption", "dim-label"]))
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            text.append(Gtk.Label(label=info["title"], xalign=0, wrap=True, css_classes=["title-2"]))
+            if info.get("subtitle"):
+                text.append(Gtk.Label(label=info["subtitle"], xalign=0, wrap=True, css_classes=["dim-label"]))
+            d.append(text)
+            if info.get("error"):
+                d.append(Gtk.Label(label=info["error"], xalign=0, wrap=True, css_classes=["studio-note", "erro"]))
+            if info.get("extra"):
+                d.append(info["extra"])
+        d.append(self._pending_list())
+        if info and info.get("notes"):
+            d.append(Gtk.Label(label="Bom saber", xalign=0, css_classes=["heading"]))
+            for note in info["notes"]:
+                row = Gtk.Box(spacing=8, css_classes=["studio-note"])
+                row.append(Gtk.Image(icon_name="dialog-information-symbolic", valign=Gtk.Align.START))
+                row.append(Gtk.Label(label=note, xalign=0, wrap=True, hexpand=True))
+                d.append(row)
+
+    def _pending_list(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.append(Gtk.Label(label="O que será alterado", xalign=0, css_classes=["heading"]))
+        changes = self.sel.for_reading()
+        if not changes:
+            box.append(Gtk.Label(label="Nada selecionado ainda.", xalign=0, css_classes=["dim-label"]))
+            return box
+        box.append(Gtk.Label(label="Desmarque o que você não quer mudar.", xalign=0, wrap=True,
+                             css_classes=["caption", "dim-label"]))
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+        icons = {k: i for k, _t, i in COMPONENTS}
+        for c in changes:
+            line = Gtk.Box(spacing=10, margin_start=8, margin_end=6, margin_top=6, margin_bottom=6)
+            check = Gtk.CheckButton(active=c.enabled)
+            set_label(check, f"Aplicar {c.title}: {c.label}")
+            check.connect("toggled", lambda b, k=c.key: (self.sel.toggle(k, b.get_active()), self._refresh_chrome()))
+            line.append(check)
+            line.append(Gtk.Image(icon_name=icons[c.key]))
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+            text.append(Gtk.Label(label=c.title, xalign=0))
+            text.append(Gtk.Label(label=c.label, xalign=0, wrap=True, css_classes=["caption", "dim-label"]))
+            if c.error:
+                text.append(Gtk.Label(label=f"Falhou: {c.error}", xalign=0, wrap=True, css_classes=["caption"]))
+            line.append(text)
+            rm = Gtk.Button(icon_name="window-close-symbolic", css_classes=["flat"], valign=Gtk.Align.CENTER,
+                            tooltip_text=f"Tirar {c.title} da seleção")
+            set_label(rm, f"Tirar {c.title} da seleção")
+            rm.connect("clicked", lambda _b, k=c.key: self._unselect(k))
+            line.append(rm)
+            lst.append(Gtk.ListBoxRow(child=line, activatable=False))
+        box.append(lst)
+        return box
+
+    def _unselect(self, key):
+        self.sel.remove(key)
+        if key in ("barra", "efeitos"):
+            self._reset_drafts()
+        self._selection_changed()
+
+    # ------------------------------------------------------------ desfazer / restaurar / sobre
+    def _ask_undo(self):
+        if not self.desk.has_previous():
+            return
+        confirm(self, "Desfazer a última aplicação?",
+                "Tema, ícones, cursor, papel de parede, barra e vidro voltam a ser como estavam antes do "
+                "último “Aplicar”. Só existe um nível de desfazer.", "Desfazer", self._undo)
+
+    def _undo(self):
+        self.desk.undo()
+        self._after_restore("Última aplicação desfeita")
+
+    def _ask_restore(self):
         confirm(self, "Voltar ao visual original?",
-                "Tema, ícones, cursor, wallpaper e barra voltam a ser como eram "
+                "Tema, ícones, cursor, papel de parede, barra e vidro voltam a ser como eram "
                 f"antes de você abrir o {APP_NAME} pela primeira vez.", "Restaurar", self._restore)
 
     def _restore(self):
+        self.desk.snapshot(PREVIOUS)  # dá para desfazer a restauração também
         self.desk.restore()
-        self.refresh_marks()
-        if not self.builders["barra"][1] and self.desk.bar:
-            self._bar_sync()
-        if not self.builders["efeitos"][1]:
-            self.rebuild("efeitos")
-        self.toast("Visual original restaurado")
+        self._after_restore("Visual original restaurado")
 
-    def _about(self, _btn):
-        comments = ("Deixe seu Linux com a sua cara: temas, ícones, cursores, wallpapers e barra "
-                    "de tarefas com um clique.")
+    def _after_restore(self, message):
+        self._follow_theme()
+        self._reset_drafts()
+        if "efeitos" in self.grids or not self.builders["efeitos"][1]:
+            self.rebuild("efeitos")
+        self._selection_changed()
+        self.toast(message)
+
+    def _about(self):
+        comments = ("Deixe seu Linux com a sua cara: escolha temas, ícones, cursores, papéis de parede e a "
+                    "barra de tarefas, veja a prévia e aplique quando quiser.")
         credits = sorted({f"{i['title']} — {i['author']} {i['source']}" for i in self.store.items.values()})
         if hasattr(Adw, "AboutWindow"):
             win = Adw.AboutWindow(transient_for=self, application_name=APP_NAME, version=VERSION,

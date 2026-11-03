@@ -108,6 +108,9 @@ class PastasNaCorDaPaleta(unittest.TestCase):
         self.d.apply_palette(A.make_palettes("#2ec27e")[0])
         segundo = self.d.iface.get_string("icon-theme")
         self.assertNotEqual(primeiro, segundo)  # nome novo: os apps recarregam os ícones
+        # a anterior fica guardada para o "Desfazer" (ver test_fluxo.DesfazerPaleta); a de antes dela, não
+        self.assertTrue((A.USER_DATA / "icons" / primeiro).exists())
+        self.d.apply_palette(A.make_palettes("#3584e4")[0])
         self.assertFalse((A.USER_DATA / "icons" / primeiro).exists())
         self.assertIn("Inherits=Catppuccin-Mocha,",
                       (A.USER_DATA / "icons" / segundo / "index.theme").read_text())
@@ -161,3 +164,129 @@ class PainelDoSistemaNaCor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PapelDeParedeNasCoresDaPaleta(unittest.TestCase):
+    """
+    Pedido do usuário: gerar papéis de parede (montanhas, ondas, gradiente, formas) com as cores
+    escolhidas, e "Variar desenho" com uma semente para dar para repetir o resultado.
+    """
+
+    def test_cada_desenho_gera_svg_valido_com_as_cores(self):
+        import xml.etree.ElementTree as ET
+        pal = A.make_palettes("#e01b24")[0]
+        for design, _nome in A.WALL_DESIGNS:
+            svg = A.design_svg(pal["wall"], design, 3)
+            ET.fromstring(svg)  # XML válido
+            self.assertTrue(pal["wall"][2] in svg or pal["wall"][3] in svg, f"{design} usa o destaque da paleta")
+            self.assertEqual(svg, A.design_svg(pal["wall"], design, 3), "mesma semente, mesmo desenho")
+            self.assertNotEqual(svg, A.design_svg(pal["wall"], design, 4), "outra semente, outro desenho")
+
+    def test_paleta_grava_o_desenho_escolhido(self):
+        A.Desktop._clear_gtk4()
+        pal = dict(A.make_palettes("#2ec27e")[1], design="montanhas", seed=2)
+        wall = A.Desktop().apply_palette(pal)
+        self.assertIn("montanhas 2", wall.read_text())
+        self.assertTrue(wall.name.endswith("-montanhas-2.svg"))
+
+
+class MontanhasComProfundidade(unittest.TestCase):
+    """
+    Regressão: no modelo Montanhas com a paleta clara, a camada da frente saía quase branca, mais
+    clara que as do fundo (a profundidade ficava invertida) e o desenho parecia infantil.
+    Agora a camada mais perto é sempre a mais escura, no claro e no escuro.
+    """
+
+    def test_frente_mais_escura_que_o_fundo(self):
+        import re
+        for pal in A.make_palettes("#2190a4"):  # escuras e a clara
+            svg = A.design_svg(pal["wall"], "montanhas", 0)
+            serras = re.findall(r'class="serra" fill="url\(#s(\d)\)"', svg)
+            cores = dict(re.findall(r'<linearGradient id="s(\d)"[^>]*><stop offset="0" stop-color="(#[0-9a-f]{6})"', svg))
+            self.assertGreaterEqual(len(serras), 4, pal["key"])
+            lum = [A.luminance(cores[i]) for i in serras]
+            self.assertEqual(lum, sorted(lum, reverse=True), f"{pal['key']}: do fundo para a frente escurece")
+
+    def test_cristas_suaves(self):
+        """Pedido do usuário: as pontas finas ficaram “agressivas”. As serras são curvas com poucos morros."""
+        import re
+        svg = A.design_svg(A.make_palettes("#9141ac")[1]["wall"], "montanhas", 5)
+        for d in re.findall(r'class="serra"[^>]* d="([^"]+)"', svg):
+            self.assertNotIn(",", d.split("L")[0], "sem polígono de pontos retos")
+            self.assertLessEqual(d.count(" C"), 16, "poucos morros por camada")
+
+
+class CartoesLegiveisNaPaleta(unittest.TestCase):
+    """
+    Regressão: com uma paleta escura aplicada, cartões e listas dos apps GTK 4 (inclusive o
+    “O que será alterado” do próprio app) ficavam brancos com texto claro, ilegíveis. O CSS da
+    paleta não definia card_bg_color e o fundo dos cartões caía no padrão branco.
+    """
+
+    def test_paleta_define_os_cartoes_com_contraste(self):
+        for cor in ("#2190a4", "#e01b24"):
+            for pal in A.make_palettes(cor):
+                cores = dict(A.DEFINE.findall(A.palette_css(pal)))
+                for nome in ("card_bg_color", "card_fg_color", "popover_bg_color", "dialog_bg_color"):
+                    self.assertIn(nome, cores, pal["key"])
+                self.assertGreaterEqual(A.contrast(cores["card_fg_color"].strip(), cores["card_bg_color"].strip()), 7,
+                                        f"{cor} {pal['key']}")
+
+
+class PaisagemEntardecer(unittest.TestCase):
+    """
+    Pedido do usuário: paisagens ilustradas (começando por montanhas ao entardecer) em SVG com
+    camadas por função, recoloríveis pela paleta sem perder a relação de claro/escuro entre as
+    camadas, e com o centro tranquilo para não brigar com janelas e ícones.
+    """
+
+    PAPEIS = ["ceu", "luz", "distantes", "intermediarias", "primeiro-plano", "destaques"]
+
+    def cores_do_papel(self, svg, papel):
+        import re
+        grupo = re.search(rf'<g id="{papel}"[^>]*>(.*?)</g><!-- /{papel} -->', svg, re.S)
+        self.assertIsNotNone(grupo, papel)
+        return re.findall(r'fill="(#[0-9a-f]{6})"', grupo.group(1))
+
+    def test_camadas_por_funcao_e_profundidade_em_qualquer_paleta(self):
+        paletas = [A.LANDSCAPE_DEFAULT] + [p["wall"] for cor in ("#2190a4", "#e01b24", "#2ec27e")
+                                           for p in A.make_palettes(cor)]
+        for wall in paletas:
+            svg = A.design_svg(wall, "entardecer", 0)
+            import xml.etree.ElementTree as ET
+            ET.fromstring(svg)
+            lum = {p: max(A.luminance(c) for c in self.cores_do_papel(svg, p))
+                   for p in ("distantes", "intermediarias", "primeiro-plano")}
+            self.assertGreater(lum["distantes"], lum["intermediarias"], wall)
+            self.assertGreater(lum["intermediarias"], lum["primeiro-plano"], wall)
+            for papel in self.PAPEIS:
+                self.assertIn(f'<g id="{papel}"', svg)
+
+    def test_centro_tranquilo(self):
+        import re
+        svg = A.design_svg(A.LANDSCAPE_DEFAULT, "entardecer", 3)
+        frente = re.search(r'<g id="primeiro-plano"[^>]*>(.*?)</g><!-- /primeiro-plano -->', svg, re.S).group(1)
+        for x, y in re.findall(r'data-pinheiro="(\d+),(\d+)"', frente):
+            meio = .3 * 3840 < int(x) < .7 * 3840
+            self.assertFalse(meio and int(y) < .82 * 2160, f"pinheiro grande no meio da tela em {x},{y}")
+
+
+class PretoEBrancoNaCorFavorita(unittest.TestCase):
+    """
+    Regressão: em Cores → “Outra…”, escolher preto gerava as mesmas paletas cinza-médio do Cinza
+    (destaque #808080), parecendo que a escolha não funcionava; e as quatro paletas escuras saíam
+    idênticas. Cor sem saturação caía num cinza fixo, sem olhar se era clara ou escura.
+    """
+
+    def test_preto_fica_preto(self):
+        preto = A.make_palettes("#000000")
+        cinza = A.make_palettes("#8a8f98")
+        escuras = [p for p in preto if p["dark"]]
+        self.assertLess(A.luminance(escuras[0]["bg"]), A.luminance(cinza[0]["bg"]), "fundo mais escuro que o do Cinza")
+        self.assertNotEqual(escuras[0]["accent"], cinza[0]["accent"])
+        self.assertEqual(len({p["accent2"] for p in escuras}), len(escuras), "as paletas escuras não são iguais")
+
+    def test_branco_tem_destaque_claro_e_paletas_diferentes(self):
+        branco = [p for p in A.make_palettes("#ffffff") if p["dark"]]
+        self.assertGreater(A.luminance(branco[0]["accent"]), A.luminance(A.make_palettes("#8a8f98")[0]["accent"]))
+        self.assertEqual(len({p["accent2"] for p in branco}), len(branco))

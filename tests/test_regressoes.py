@@ -178,6 +178,7 @@ class NautilusPegaOTema(unittest.TestCase):
         self.assertFalse(A.reload_files_app(None))
 
 
+
 class ShellFalso:
     """D-Bus com um GNOME Shell que conhece (ou não) a extensão User Themes."""
 
@@ -385,5 +386,47 @@ class CatalogoDoRepositorio(unittest.TestCase):
             self.assertIn(hidden, items["fluent-icons"]["dirs"])
 
 
+class TemaClaroSemLightNoNome(unittest.TestCase):
+    """
+    Regressão: aplicar o Adwaita (ou o Yaru) deixava os apps GTK 4 no modo escuro e os GTK 3
+    claros, e a prévia o mostrava como tema escuro. O claro/escuro era deduzido pela palavra
+    "light" no nome; o CSS do Adwaita não tem cores para ler ("Adwaita is now part of GTK+ 3").
+    """
+
+    def test_adwaita_e_claro(self):
+        pasta = A.USER_DATA / "themes" / "Adwaita"
+        (pasta / "gtk-3.0").mkdir(parents=True, exist_ok=True)
+        (pasta / "gtk-3.0" / "gtk.css").write_text("/* Adwaita is now part of GTK+ 3 */\n")
+        tema = A.Theme("Adwaita", pasta)
+        self.assertFalse(A.is_dark(A.theme_palette(tema)))
+        d = A.Desktop()
+        d.apply_gtk(tema)
+        self.assertEqual(d.iface.get_string("color-scheme"), "prefer-light")
+
+    def test_escuro_pelo_nome_continua_escuro(self):
+        pasta = A.USER_DATA / "themes" / "Qualquer-Dark"
+        (pasta / "gtk-3.0").mkdir(parents=True, exist_ok=True)
+        (pasta / "gtk-3.0" / "gtk.css").write_text("/* sem cores */\n")
+        self.assertTrue(A.is_dark(A.theme_palette(A.Theme("Qualquer-Dark", pasta))))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TemasOcultosForaDaLista(unittest.TestCase):
+    """
+    Regressão: os temas “Adon Pastas …” (gerados pelo app para pintar as pastas com a paleta)
+    apareciam na seção Ícones como se fossem temas para escolher. Eles são marcados Hidden=true.
+    """
+
+    def test_tema_de_icones_oculto_nao_aparece(self):
+        pasta = A.USER_DATA / "icons" / "Oculto-Teste"
+        pasta.mkdir(parents=True, exist_ok=True)
+        (pasta / "index.theme").write_text("[Icon Theme]\nName=Oculto\nHidden=true\nDirectories=a\n")
+        visivel = A.USER_DATA / "icons" / "Visivel-Teste"
+        visivel.mkdir(parents=True, exist_ok=True)
+        (visivel / "index.theme").write_text("[Icon Theme]\nName=Visivel\nDirectories=a\n")
+        temas = A.list_icon_themes()
+        self.assertNotIn("Oculto-Teste", temas)
+        self.assertIn("Visivel-Teste", temas)
