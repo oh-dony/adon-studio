@@ -100,6 +100,67 @@ def monitor_ids():
     return ids
 
 
+FILES_APP = "org.gnome.Nautilus"
+
+
+def session_bus():
+    try:
+        return Gio.bus_get_sync(Gio.BusType.SESSION)
+    except GLib.Error:
+        return None
+
+
+def _files_app_running(bus):
+    return bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                         "NameHasOwner", GLib.Variant("(s)", (FILES_APP,)), GLib.VariantType("(b)"),
+                         Gio.DBusCallFlags.NONE, -1, None).unpack()[0]
+
+
+def reload_files_app(bus=None, wait=200):
+    """O Nautilus fica rodando em segundo plano e, como todo app GTK4, só lê ~/.config/gtk-4.0 ao
+    abrir. Encerra o Nautilus ("quit" só fecha as janelas; "kill" encerra o serviço) e, se ele
+    tinha janela aberta, abre uma nova (já com o tema novo).
+    True se ele estava rodando."""
+    bus = bus if bus is not None else session_bus()
+    if bus is None:
+        return False
+    try:
+        if not _files_app_running(bus):
+            return False
+        try:
+            xml = bus.call_sync(FILES_APP, "/org/gnome/Nautilus/window", "org.freedesktop.DBus.Introspectable",
+                                "Introspect", None, GLib.VariantType("(s)"), Gio.DBusCallFlags.NONE, -1,
+                                None).unpack()[0]
+            windows = len(Gio.DBusNodeInfo.new_for_xml(xml).nodes)
+        except GLib.Error:
+            windows = 0
+        bus.call_sync(FILES_APP, "/org/gnome/Nautilus", "org.gtk.Actions", "Activate",
+                      GLib.Variant("(sava{sv})", ("kill", [], {})), None, Gio.DBusCallFlags.NONE, -1, None)
+    except GLib.Error:
+        return False
+    if not windows:
+        return True
+    tries = [0]
+
+    def reopen():
+        # espera o Nautilus antigo sair do barramento; senão o pedido chega a ele, que está fechando
+        tries[0] += 1
+        try:
+            if _files_app_running(bus) and tries[0] < 25:
+                return True
+        except GLib.Error:
+            pass
+        bus.call(FILES_APP, "/org/gnome/Nautilus", "org.freedesktop.Application", "Activate",
+                 GLib.Variant("(a{sv})", ({},)), None, Gio.DBusCallFlags.NONE, -1, None, None, None)
+        return False
+    if wait:
+        GLib.timeout_add(wait, reopen)
+    else:
+        while reopen():
+            pass
+    return True
+
+
 class Desktop:
     """Lê e aplica as configurações de aparência, e guarda o ponto de restauração."""
 
@@ -212,6 +273,9 @@ class Desktop:
                                                  f'@import url("{(src / name).as_uri()}");\n')
             if (src / "assets").is_dir():
                 (GTK4_CFG / "assets").symlink_to(src / "assets")
+        if Blur.installed():
+            Blur().keep_theme_colors()
+        reload_files_app()
 
     def apply_icons(self, name):
         self.iface.set_string("icon-theme", name)
@@ -546,6 +610,16 @@ class Blur:
     def set(self, part, on):
         if part in self.parts:
             self.parts[part].set_boolean("blur", on)
+        if part == "popup" and on:
+            self.keep_theme_colors()
+
+    def keep_theme_colors(self):
+        """Por padrão a extensão troca o fundo dos pop-ups por um estilo dela que pinta os botões do
+        painel (Wi-Fi, Bluetooth...) com -st-accent-color; no GNOME 46 isso não existe e vira azul
+        #3584e4, vencendo a cor do tema. Preservar o tema do Shell mantém a cor do tema."""
+        s = self.parts.get("popup")
+        if has_key(s, "preserve-shell-theme"):
+            s.set_boolean("preserve-shell-theme", True)
 
     def adapt(self, zorin):
         """No Zorin a barra superior do GNOME fica escondida: vidro nela vira um bloco solto na tela."""
@@ -617,7 +691,9 @@ class Blur:
         self.adapt(zorin)
 
     def snapshot(self):
-        return {p: self.get(p) for p in self.parts} | {"_windows": self.windows()}
+        s = self.parts.get("popup")
+        extra = {"_preserve": s.get_boolean("preserve-shell-theme")} if has_key(s, "preserve-shell-theme") else {}
+        return {p: self.get(p) for p in self.parts} | {"_windows": self.windows()} | extra
 
     def restore(self, saved):
         """Volta ao que estava no backup; sem backup do vidro, desliga tudo."""
@@ -626,6 +702,9 @@ class Blur:
             if p != "applications":
                 self.set(p, saved.get(p, False))
         self.set_windows(saved.get("_windows", "nenhuma"))
+        s = self.parts.get("popup")
+        if has_key(s, "preserve-shell-theme"):
+            s.set_boolean("preserve-shell-theme", saved.get("_preserve", False))
 
 
 # ---------------------------------------------------------------- cores e desenho

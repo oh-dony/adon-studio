@@ -12,6 +12,8 @@ for var, sub in (("HOME", "home"), ("XDG_DATA_HOME", "home/.local/share"),
     os.environ[var] = str(_tmp / sub)
     (_tmp / sub).mkdir(parents=True, exist_ok=True)
 os.environ["GSETTINGS_BACKEND"] = "memory"
+# sem acesso ao D-Bus da sessão de verdade: nada de fechar o Nautilus ou falar com o Shell do computador
+os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={_tmp / 'sem-dbus'}"
 os.environ["ADON_STUDIO_CATALOG"] = (_tmp / "loja" / "catalog.json").as_uri()
 (_tmp / "loja").mkdir()
 
@@ -34,6 +36,9 @@ def _blur_schemas():
             keys = f'<key name="blur" type="b"><default>{"true" if part != "applications" else "false"}</default></key>'
             keys += ('<key name="pipeline" type="s"><default>"pipeline_default"</default></key>' if modern else
                      '<key name="customize" type="b"><default>true</default></key>')
+            if part == "popup" and modern:
+                keys += ('<key name="override-background" type="b"><default>true</default></key>'
+                         '<key name="preserve-shell-theme" type="b"><default>false</default></key>')
             if part == "applications":
                 keys += ('<key name="enable-all" type="b"><default>false</default></key>'
                          '<key name="opacity" type="i"><default>215</default></key>'

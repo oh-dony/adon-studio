@@ -38,6 +38,42 @@ class VidroNoZorin(unittest.TestCase):
         self.assertFalse(self.blur.get("panel"))
 
 
+class CorDoTemaNoPainel(unittest.TestCase):
+    """
+    Regressão: com o vidro dos pop-ups ligado, os botões Wi-Fi, Bluetooth e Estilo escuro do painel
+    ficavam azuis (#3584e4) em vez da cor do tema (o rosa do Catppuccin, por exemplo). A Blur my
+    Shell, por padrão, troca o fundo dos pop-ups por um estilo dela que pinta os botões com
+    -st-accent-color, que não existe no GNOME 46, e cai no azul. CSS de extensão vence até o
+    !important do tema. Ligar "preserve-shell-theme" mantém as cores do tema.
+    """
+
+    def setUp(self):
+        self.blur = A.Blur()
+        reset(self.blur)
+
+    def preserva(self):
+        return self.blur.parts["popup"].get_boolean("preserve-shell-theme")
+
+    def test_preset_preserva_o_tema(self):
+        self.blur.apply_preset(A.BLUR_PRESETS["Vidro forte"], zorin=True)
+        self.assertTrue(self.preserva())
+
+    def test_ligar_vidro_dos_popups_preserva_o_tema(self):
+        self.blur.set("popup", True)
+        self.assertTrue(self.preserva())
+
+    def test_versao_antiga_sem_a_chave_nao_quebra(self):
+        antigo = A.Blur("org.adon.teste.blur-antigo")
+        antigo.set("popup", True)
+        antigo.keep_theme_colors()
+
+    def test_restaurar_volta_o_valor_original(self):
+        saved = self.blur.snapshot()
+        self.blur.set("popup", True)
+        self.blur.restore(saved)
+        self.assertFalse(self.preserva())
+
+
 class IntensidadeDoVidro(unittest.TestCase):
     """
     A intensidade fica em lugares diferentes conforme a versão da Blur my Shell: na nova

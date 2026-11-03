@@ -116,6 +116,68 @@ class TemaGtk4(unittest.TestCase):
         self.assertEqual(desk.iface.get_string("color-scheme"), "prefer-light")
 
 
+class FakeBus:
+    """Imita o D-Bus da sessão com um Nautilus rodando (ou não) e N janelas abertas."""
+
+    def __init__(self, running, windows=0):
+        self.running, self.windows, self.calls = running, windows, []
+
+    def call_sync(self, name, path, iface, method, args, *_rest):
+        self.calls.append(method if method != "Activate" else f"{iface}.{args.unpack()[0] if args.n_children() > 1 else ''}")
+        if method == "NameHasOwner":
+            return A.GLib.Variant("(b)", (self.running,))
+        if method == "Introspect":
+            nodes = "".join(f'<node name="{i}"/>' for i in range(1, self.windows + 1))
+            return A.GLib.Variant("(s)", (f"<node>{nodes}</node>",))
+        if method == "Activate" and iface == "org.gtk.Actions":
+            self.running = False
+        return None
+
+    def call(self, name, path, iface, method, *_rest):
+        self.calls.append(f"{iface}.{method}")
+
+
+class NautilusPegaOTema(unittest.TestCase):
+    """
+    Regressão: ao escolher um combo (ou tema), o Nautilus continuava cinza, da cor do Zorin. Ele
+    fica rodando em segundo plano o tempo todo (--gapplication-service) e um app GTK4 só lê
+    ~/.config/gtk-4.0/gtk.css quando abre; o arquivo era trocado, mas o Nautilus nunca relia.
+    """
+
+    def test_aplicar_tema_recarrega_o_nautilus(self):
+        calls = []
+        orig = A.reload_files_app
+        A.reload_files_app = lambda *a, **k: calls.append(1)
+        try:
+            theme = A.USER_DATA / "themes" / "Recarrega"
+            mkdirs(theme / "gtk-4.0", theme / "gtk-3.0")
+            (theme / "gtk-4.0" / "gtk.css").write_text("")
+            A.Desktop().apply_gtk(A.Theme("Recarrega", theme))
+        finally:
+            A.reload_files_app = orig
+        self.assertEqual(calls, [1])
+
+    def test_fecha_e_reabre_quando_tinha_janela(self):
+        bus = FakeBus(running=True, windows=2)
+        self.assertTrue(A.reload_files_app(bus, wait=0))
+        self.assertIn("org.gtk.Actions.kill", bus.calls, "quit só fecha as janelas; o serviço continua")
+        self.assertEqual(bus.calls[-1], "org.freedesktop.Application.Activate", "reabre uma janela")
+
+    def test_so_fecha_o_servico_quando_nao_tinha_janela(self):
+        bus = FakeBus(running=True, windows=0)
+        A.reload_files_app(bus, wait=0)
+        self.assertIn("org.gtk.Actions.kill", bus.calls, "quit só fecha as janelas; o serviço continua")
+        self.assertNotIn("org.freedesktop.Application.Activate", bus.calls)
+
+    def test_nautilus_fechado_nao_e_aberto(self):
+        bus = FakeBus(running=False)
+        self.assertFalse(A.reload_files_app(bus, wait=0))
+        self.assertEqual(bus.calls, ["NameHasOwner"])
+
+    def test_sem_dbus_nao_quebra(self):
+        self.assertFalse(A.reload_files_app(None))
+
+
 class ImagensDoTemaGtk4(unittest.TestCase):
     """
     Regressão: com o tema Dracula, os interruptores (liga/desliga) ficavam invisíveis em todos os
