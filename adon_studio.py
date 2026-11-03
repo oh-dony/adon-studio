@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # Adon Studio — personalize o visual do GNOME com um clique.
 import colorsys
+import ctypes
 import hashlib
 import json
 import os
 import re
 import shutil
 import struct
+import sys
 import tarfile
+import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from math import pi
@@ -56,6 +59,25 @@ TASKBAR_KEYS = ["panel-lengths", "panel-anchors", "panel-sizes", "panel-position
                 "global-border-radius", "trans-use-custom-opacity", "trans-panel-opacity", "intellihide"]
 
 POOL = ThreadPoolExecutor(max_workers=4)
+# achar ícones é Python puro (segura o GIL): numa fila própria de uma thread, para não disputar com
+# a tela principal. Ler as imagens (GdkPixbuf solta o GIL) continua rápido nessa mesma thread.
+ICON_POOL = ThreadPoolExecutor(max_workers=1)
+
+
+def _return_big_buffers():
+    """Buffers grandes (uma foto 4K decodificada tem ~30 MB) sempre em mmap, devolvidos ao sistema
+    ao soltar. Sem isso o glibc sobe o limite sozinho depois do primeiro e passa a guardá-los no
+    heap de cada thread: a aba Papel de parede deixava o app com +150 MB para 5 MB de miniaturas."""
+    try:
+        ctypes.CDLL("libc.so.6").mallopt(-3, 1 << 20)  # M_MMAP_THRESHOLD = 1 MB
+    except (OSError, AttributeError):
+        pass
+
+
+_return_big_buffers()
+# Cada chamada ao GTK solta o GIL e pega de volta. Com uma thread de fundo ocupada e o intervalo
+# padrão (5 ms), a tela principal esperava por ela a cada chamada: 300 chamadas iam de 0,1 a 143 ms.
+sys.setswitchinterval(0.0002)
 
 # Loja: catálogo e pacotes de tema publicados nas Releases do GitHub
 CATALOG_URL = os.environ.get("ADON_STUDIO_CATALOG",
@@ -1018,23 +1040,130 @@ ICON_SAMPLES = [["folder", "inode-directory"], ["user-home", "folder-home"],
 ICON_LABELS = ["Pasta", "Pasta pessoal", "Navegador", "Terminal", "Configurações", "Editor de texto", "Lixeira"]
 
 
-def icon_theme(name):
-    theme = Gtk.IconTheme()
-    theme.set_search_path([str(d) for d in ICON_DIRS] + ["/usr/share/pixmaps"])
-    theme.set_theme_name(name)
-    return theme
+ICON_EXT = (".png", ".svg", ".xpm")
 
 
-def icon_paintables(name, size, samples=ICON_SAMPLES):
-    theme = icon_theme(name)
-    return [theme.lookup_icon(n[0], n[1:], size, 1, Gtk.TextDirection.NONE, 0) for n in samples]
+ICON_INDEX = {}  # tema → o que o _icon_index leu; o _scan() esvazia
+ICON_HITS = {}   # (tema, nome, tamanho) → arquivo achado só naquele tema, ou None
+
+
+def _icon_index(name):
+    # sempre por variável local: o _scan() pode esvaziar o cache no meio, da tela principal
+    found = ICON_INDEX.get(name)
+    if found is None:
+        found = ICON_INDEX[name] = _read_icon_index(name)
+    return found
+
+
+def _read_icon_index(name):
+    """Pastas do tema `name` (o mesmo tema pode estar em ~/.local/share/icons e em /usr/share/icons),
+    os diretórios do index.theme com o tamanho de cada um, e os temas de que ele herda."""
+    bases = [b / name for b in ICON_DIRS if (b / name).is_dir()]
+    kf = next((k for k in map(_index, bases) if k), None)
+    if not kf:
+        return bases, [], []
+
+    def get(group, key, kind=int, default=None):
+        try:
+            return (kf.get_integer if kind is int else kf.get_string)(group, key)
+        except GLib.Error:
+            return default
+    dirs = []
+    listed = (get("Icon Theme", "Directories", str, "") + "," + get("Icon Theme", "ScaledDirectories", str, ""))
+    for d in dict.fromkeys(x.strip() for x in listed.split(",") if x.strip()):
+        size = get(d, "Size")
+        if size is None or (get(d, "Scale") or 1) != 1:
+            continue
+        kind = get(d, "Type", str, "Threshold")
+        lo, hi = {"Fixed": (size, size),
+                  "Scalable": (get(d, "MinSize") or size, get(d, "MaxSize") or size)}.get(
+            kind, (size - (get(d, "Threshold") or 2), size + (get(d, "Threshold") or 2)))
+        dirs.append((d, lo, hi))
+    inherits = [x.strip() for x in get("Icon Theme", "Inherits", str, "").split(",") if x.strip()]
+    return bases, dirs, inherits
+
+
+def _in_theme(theme, name, size):
+    """O arquivo de `name` só dentro de `theme` (sem os pais): no tamanho exato ou no mais próximo."""
+    key = (theme, name, size)
+    if key in ICON_HITS:
+        return ICON_HITS.get(key)
+    bases, dirs, _inherits = _icon_index(theme)
+    best = None
+    for _gap, d in sorted((0 if lo <= size <= hi else min(abs(size - lo), abs(size - hi)), d)
+                          for d, lo, hi in dirs):
+        best = next((str(b / d / (name + e)) for b in bases for e in ICON_EXT
+                     if os.path.isfile(b / d / (name + e))), None)
+        if best:
+            break
+    ICON_HITS[key] = best
+    return best
+
+
+def find_icon(theme, names, size):
+    """Caminho do arquivo do ícone, como manda a especificação de temas de ícones (freedesktop):
+    no tema e depois nos que ele herda (por fim o hicolor), cada nome em ordem; no tamanho exato e,
+    sem ele, o mais próximo do mesmo tema. Não usa o Gtk.IconTheme: o GTK não devolve a memória
+    de um tema ao soltá-lo (~3 MB cada, 7 MB o Papirus), e aqui só se confere se o arquivo existe.
+    O que já se achou em cada tema fica guardado (o hicolor e o Adwaita são pais de quase todos)."""
+    chain, seen = [theme], set()
+    while chain:
+        t = chain.pop(0)
+        if t in seen:
+            continue
+        seen.add(t)
+        for name in names:
+            hit = _in_theme(t, name, size)
+            if hit:
+                return hit
+        chain += _icon_index(t)[2]
+        if not chain and "hicolor" not in seen:
+            chain.append("hicolor")
+    return None
+
+
+ICON_FILES = {}  # (tema, nomes, tamanho) → arquivo do ícone (ou None); o _scan() esvazia
+
+
+def icon_images(name, size, samples=ICON_SAMPLES):
+    """Gtk.Image vazias que se preenchem com os ícones do tema quando eles chegam: achar os arquivos
+    e ler as imagens roda fora da tela principal (no Papirus a primeira busca do GTK levava 0,2 s)."""
+    images = [Gtk.Image(pixel_size=size) for _ in samples]
+    keys = [(name, tuple(n), size) for n in samples]
+    scale = 2  # nítido em tela HiDPI; numa tela comum o GTK reduz
+
+    def work():
+        out = []
+        for k in keys:
+            path = ICON_FILES.get(k, False)
+            if path is False:
+                path = ICON_FILES[k] = find_icon(name, k[1], size)
+            tex = None
+            if path:
+                try:
+                    tex = Gdk.Texture.new_for_pixbuf(
+                        GdkPixbuf.Pixbuf.new_from_file_at_size(path, size * scale, size * scale))
+                except GLib.Error:
+                    pass
+            out.append(tex)
+        GLib.idle_add(done, out)
+
+    def done(out):
+        for img, tex in zip(images, out):
+            if tex:
+                img.set_from_paintable(tex)
+            else:
+                img.set_from_icon_name("image-missing-symbolic")
+        return False
+    ICON_POOL.submit(work)
+    return images
 
 
 def icon_preview(name, size=32, count=5):
     """Sempre os mesmos aplicativos, na mesma ordem, para dar para comparar os temas."""
     box = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=10, margin_bottom=10)
-    for paint in icon_paintables(name, size, ICON_SAMPLES[:count]):
-        box.append(Gtk.Image(paintable=paint, pixel_size=size))
+    for img in icon_images(name, size, ICON_SAMPLES[:count]):
+        box.append(img)
     return box
 
 
@@ -1083,11 +1212,26 @@ def cursor_textures(path, want=32, count=4):
     return out
 
 
+def cursor_images(path, want=32, count=4, missing_size=24):
+    """Gtk.Image que se preenchem com as imagens do cursor: os arquivos Xcursor (até alguns MB, com
+    todos os tamanhos e quadros) são lidos fora da tela principal."""
+    images = [Gtk.Image(pixel_size=want) for _ in range(count)]
+
+    def done(texs):
+        for img, tex in zip(images, texs):
+            if tex:
+                img.set_from_paintable(tex)
+            else:
+                img.set_pixel_size(missing_size)
+                img.set_from_icon_name("image-missing-symbolic")
+        return False
+    ICON_POOL.submit(lambda: GLib.idle_add(done, cursor_textures(path, want, count)))
+    return images
+
+
 def cursor_preview(path, count=4):
     box = Gtk.Box(spacing=14, halign=Gtk.Align.CENTER, margin_top=10, margin_bottom=10)
-    for tex, label in zip(cursor_textures(path, 32, count), CURSOR_LABELS):
-        img = Gtk.Image(paintable=tex, pixel_size=32) if tex else \
-            Gtk.Image(icon_name="image-missing-symbolic", pixel_size=24)
+    for img, label in zip(cursor_images(path, 32, count), CURSOR_LABELS):
         img.set_tooltip_text(label)
         box.append(img)
     return box
@@ -1918,21 +2062,71 @@ class Spinner(Gtk.DrawingArea):
         cr.stroke()
 
 
+THUMBS = Path(GLib.get_user_cache_dir()) / "thumbnails"  # padrão freedesktop, o mesmo do app Arquivos
+FULL_DECODES = threading.Semaphore(2)  # foto inteira na memória (até 100 MB cada): no máximo duas
+
+
+def _fit(pb, width, height):
+    s = min(width / pb.get_width(), height / pb.get_height(), 1)
+    if s >= 1:
+        return pb
+    return pb.scale_simple(max(1, round(pb.get_width() * s)), max(1, round(pb.get_height() * s)),
+                           GdkPixbuf.InterpType.BILINEAR)
+
+
+def system_thumb(path, width, height):
+    """Miniatura de ~/.cache/thumbnails/large (256 px), criando se faltar. O JPEG não sai reduzido
+    do GdkPixbuf: uma foto 6144×4292 ocupa 100 MB por um instante. Com a miniatura do sistema, abrir
+    a aba Papel de parede nem lê as fotos. None quando não vale (imagem pequena, SVG, cartão grande)."""
+    path = Path(path)
+    if max(width, height) > 256 or path.suffix.lower() == ".svg":
+        return None
+    try:
+        mtime = str(int(path.stat().st_mtime))
+        uri = Gio.File.new_for_path(str(path)).get_uri()
+    except OSError:
+        return None
+    thumb = THUMBS / "large" / (hashlib.md5(uri.encode()).hexdigest() + ".png")
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_file(str(thumb))
+        if pb.get_option("tEXt::Thumb::MTime") == mtime:
+            return pb
+    except GLib.Error:
+        pass
+    info = GdkPixbuf.Pixbuf.get_file_info(str(path))
+    if not info[0] or max(info[1], info[2]) <= 512:  # pequena: abrir a original já é barato
+        return None
+    with FULL_DECODES:
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), 256, 256, True)
+    try:
+        thumb.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        part = thumb.with_suffix(f".{os.getpid()}.{threading.get_ident()}.part")
+        pb.savev(str(part), "png", ["tEXt::Thumb::URI", "tEXt::Thumb::MTime"], [uri, mtime])
+        part.chmod(0o600)
+        part.rename(thumb)
+    except (OSError, GLib.Error):
+        pass
+    return pb
+
+
 def thumb_texture(path, width, height):
     """Imagem já reduzida ao tamanho do cartão: a Gtk.Picture usa o tamanho da imagem como largura
     natural, e uma imagem grande esticaria o cartão (e a grade inteira junto)."""
-    pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), width, height, True)
-    return Gdk.Texture.new_for_pixbuf(pb)
+    pb = system_thumb(path, width, height)
+    if pb is None:
+        with FULL_DECODES:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), width, height, True)
+    return Gdk.Texture.new_for_pixbuf(_fit(pb, width, height))
 
 
 def load_async(pic, path, width, height):
     """Carrega a miniatura fora da tela principal para a janela não travar."""
     def work():
         try:
-            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), width, height, True)
+            tex = thumb_texture(path, width, height)
         except GLib.Error:
             return
-        GLib.idle_add(lambda: pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb)) or False)
+        GLib.idle_add(lambda: pic.set_paintable(tex) or False)
     POOL.submit(work)
 
 
@@ -2029,17 +2223,8 @@ class Grid(Gtk.Box):
             bar.append(extra)
         if search or extra:
             self.append(bar)
-        if filters:
-            fbox = Gtk.Box(spacing=6, margin_start=margin, margin_end=margin, margin_top=10)
-            first = None
-            for label, tag in filters:
-                b = Gtk.ToggleButton(label=label, active=first is None, css_classes=["pill"])
-                if first:
-                    b.set_group(first)
-                first = first or b
-                b.connect("toggled", lambda b, t=tag: b.get_active() and self.filter_tag(t))
-                fbox.append(b)
-            self.append(fbox)
+        self._margin, self._filters = margin, None
+        self.set_filters(filters)
         self.flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, valign=Gtk.Align.START,
                                 max_children_per_line=6, min_children_per_line=1, row_spacing=14,
                                 column_spacing=14, margin_start=margin, margin_end=margin, margin_top=12,
@@ -2061,6 +2246,26 @@ class Grid(Gtk.Box):
         self.status.add_named(load, "carregando")
         self.status.add_named(empty or status_page("folder-symbolic", "Nada por aqui"), "vazio")
         self.append(self.status)
+
+    def set_filters(self, filters):
+        """Filtros em pílula (ex.: Todos/Escuros/Claros). Dá para pôr depois de montar os cartões."""
+        if self._filters:
+            self.remove(self._filters)
+            self._filters, self.tag = None, None
+        if not filters:
+            return
+        fbox = Gtk.Box(spacing=6, margin_start=self._margin, margin_end=self._margin, margin_top=10)
+        first = None
+        for label, tag in filters:
+            b = Gtk.ToggleButton(label=label, active=first is None, css_classes=["pill"])
+            if first:
+                b.set_group(first)
+            first = first or b
+            b.connect("toggled", lambda b, t=tag: b.get_active() and self.filter_tag(t))
+            fbox.append(b)
+        status = getattr(self, "status", None)
+        self.insert_child_after(fbox, status.get_prev_sibling() if status else self.get_last_child())
+        self._filters = fbox
 
     @staticmethod
     def _btn(child):
@@ -2134,20 +2339,12 @@ class Grid(Gtk.Box):
             box.append(extra)
         check = Gtk.Image(icon_name="object-select-symbolic", css_classes=["studio-check"], visible=False,
                           halign=Gtk.Align.END, valign=Gtk.Align.START, margin_top=6, margin_end=6)
-        # véu do "carregando": círculo girando enquanto trabalha, ✓ quando termina
-        stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, halign=Gtk.Align.CENTER,
-                          valign=Gtk.Align.CENTER, hexpand=True, vexpand=True)
-        stack.add_named(Spinner(40), "load")
-        stack.add_named(Gtk.Image(icon_name="object-select-symbolic", pixel_size=26,
-                                  css_classes=["studio-done"]), "ok")
-        veil = Gtk.Box(css_classes=["studio-veil"], visible=False)
-        veil.append(stack)
         overlay = Gtk.Overlay(child=box)
         overlay.add_overlay(check)
-        overlay.add_overlay(veil)
         btn = Gtk.Button(child=overlay, css_classes=["card", "studio-card"])
         btn.title, btn.search_text, btn.kind, btn.tags = title, f"{title} {subtitle or ''}".lower(), kind, set(tags)
-        btn.veil, btn.veil_stack, btn.badge, btn.check = veil, stack, badge, check
+        btn.veil = btn.veil_stack = None  # o véu de “carregando” só é criado quando for usado
+        btn.overlay, btn.badge, btn.check = overlay, badge, check
         btn.connect("clicked", lambda _b: self.working is None and self.on_pick(key))
         cell = btn
         if below:
@@ -2157,7 +2354,7 @@ class Grid(Gtk.Box):
             cell.btn = btn
         self.flow.append(cell)
         self.cards[key] = btn
-        self._describe(key)
+        self._show_state(key)  # já nasce com o “Em uso” e o selecionado certos
         if self.status.get_visible_child_name() != "lista" and self._visible(cell.get_parent()):
             self._update_status()
         return btn
@@ -2169,27 +2366,45 @@ class Grid(Gtk.Box):
         btn.set_tooltip_text(text)
         set_label(btn, text)
 
+    @staticmethod
+    def _veil(btn):
+        """Véu do “carregando”: círculo girando enquanto trabalha, ✓ quando termina. Criado na hora:
+        são quatro widgets a mais em cada cartão, e com centenas deles a grade pesa."""
+        if btn.veil is None:
+            stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, halign=Gtk.Align.CENTER,
+                              valign=Gtk.Align.CENTER, hexpand=True, vexpand=True)
+            stack.add_named(Spinner(40), "load")
+            stack.add_named(Gtk.Image(icon_name="object-select-symbolic", pixel_size=26,
+                                      css_classes=["studio-done"]), "ok")
+            btn.veil = Gtk.Box(css_classes=["studio-veil"], visible=False)
+            btn.veil.append(stack)
+            btn.veil_stack = stack
+            btn.overlay.add_overlay(btn.veil)
+        return btn.veil
+
     def start(self, key):
         """Cartão em 'carregando'; cliques na grade ficam bloqueados até finish()."""
         self.working = key
         btn = self.cards.get(key)
         if btn:
+            veil = self._veil(btn)
             btn.veil_stack.set_visible_child_name("load")
             btn.veil_stack.get_child_by_name("load").start()
-            btn.veil.set_visible(True)
+            veil.set_visible(True)
 
     def finish(self, key, ok=True):
         self.working = None
         btn = self.cards.get(key)
         if not btn:
             return
+        veil = self._veil(btn)
         btn.veil_stack.get_child_by_name("load").stop()
         if not ok:
-            btn.veil.set_visible(False)
+            veil.set_visible(False)
             return
         btn.veil_stack.set_visible_child_name("ok")
-        btn.veil.set_visible(True)  # o cartão pode ter sido recriado depois de um download
-        GLib.timeout_add(900, lambda: btn.veil.set_visible(False) or False)
+        veil.set_visible(True)  # o cartão pode ter sido recriado depois de um download
+        GLib.timeout_add(900, lambda: veil.set_visible(False) or False)
 
     def clear(self):
         while child := self.flow.get_first_child():
@@ -2197,21 +2412,29 @@ class Grid(Gtk.Box):
         self.cards, self.working = {}, None
         self._update_status()
 
+    def _show_state(self, key):
+        btn = self.cards.get(key)
+        if not btn:
+            return
+        on = key in self.picked
+        btn.badge.set_visible(key == self.in_use)
+        (btn.add_css_class if on else btn.remove_css_class)("selecionado")
+        btn.check.set_visible(on)
+        self._describe(key)
+
     def mark(self, key):
-        """Etiqueta “Em uso” no cartão do que está aplicado no sistema."""
-        self.in_use = key
-        for k, btn in self.cards.items():
-            btn.badge.set_visible(k == key)
-            self._describe(k)
+        """Etiqueta “Em uso” no cartão do que está aplicado no sistema. Só mexe nos dois cartões que
+        mudam: reescrever todos a cada clique travava a janela com centenas de cartões."""
+        old, self.in_use = self.in_use, key
+        if old != key:
+            self._show_state(old)
+            self._show_state(key)
 
     def select(self, keys):
-        """Borda e ✓ nos cartões escolhidos e ainda não aplicados."""
-        self.picked = set(keys)
-        for k, btn in self.cards.items():
-            on = k in self.picked
-            (btn.add_css_class if on else btn.remove_css_class)("selecionado")
-            btn.check.set_visible(on)
-            self._describe(k)
+        """Borda e ✓ nos cartões escolhidos e ainda não aplicados (só nos que mudaram)."""
+        old, self.picked = self.picked, set(keys)
+        for k in old ^ self.picked:
+            self._show_state(k)
 
 
 def pretty(name):
@@ -2271,8 +2494,8 @@ def desktop_preview(wall, pal, icons, width, height, fallback=WALL_PALETTES["gra
     dock = Gtk.Box(spacing=max(2, size // 4), halign=Gtk.Align.CENTER, valign=Gtk.Align.END,
                    margin_bottom=max(3, round(height * .04)), css_classes=["studio-dock"])
     if icons:
-        for paint_ in icon_paintables(icons, size, DOCK_APPS):
-            dock.append(Gtk.Image(paintable=paint_, pixel_size=size))
+        for img in icon_images(icons, size, DOCK_APPS):
+            dock.append(img)
     else:  # tema de ícones ainda não baixado: não finge mostrar os ícones dele
         for c in (pal[3], pal[2], pal[3], pal[2]):
             dock.append(drawing(size, size, lambda cr, w, h, c=c: (_src(cr, c, .8), _rr(cr, 1, 1, w - 2, h - 2, 3),
@@ -2996,6 +3219,9 @@ class Window(Adw.ApplicationWindow):
         self._render_detail()
 
     def _scan(self):
+        ICON_FILES.clear()  # tema instalado ou removido: os arquivos podem ter mudado
+        ICON_INDEX.clear()
+        ICON_HITS.clear()
         self.themes = {t.name: t for t in list_gtk_themes()}
         self.icons = list_icon_themes()
         self.cursors = dict(list_cursor_themes())
@@ -3230,10 +3456,14 @@ class Window(Adw.ApplicationWindow):
     def _palette_preview(p, w, h):
         """O papel de parede de verdade (o SVG que será gravado) com uma janela nas cores da paleta."""
         base = picture(width_request=w, height_request=h, css_classes=["studio-thumb"], overflow=Gtk.Overflow.HIDDEN)
-        try:
-            base.set_paintable(svg_texture(design_svg(p["wall"], p["design"], p["seed"]), w, h))
-        except GLib.Error:
-            pass
+
+        def work():  # gerar e desenhar o SVG leva ~20 ms por cartão: fora da tela principal
+            try:
+                tex = svg_texture(design_svg(p["wall"], p["design"], p["seed"]), w, h)
+            except GLib.Error:
+                return
+            GLib.idle_add(lambda: base.set_paintable(tex) or False)
+        POOL.submit(work)
         pal = tuple(map(rgba, (p["bg"], p["base"], p["fg"], p["accent"])))
 
         def paint(cr, ww, hh):
@@ -3278,20 +3508,22 @@ class Window(Adw.ApplicationWindow):
 
     def _build_temas(self, holder):
         self._page_header(holder, "temas")
-        pals = {n: theme_palette(t) for n, t in self.themes.items()}
-        tags = {"escuro" if is_dark(p) else "claro" for p in pals.values()}
+        tags = set()  # as cores de cada tema são lidas junto com o cartão dele, não todas antes
         grid = self.grids["temas"] = Grid(
-            lambda k: self._pick("temas", k), placeholder="Buscar temas…", filters=self._tone_filters(tags),
+            lambda k: self._pick("temas", k), placeholder="Buscar temas…",
             empty=status_page("preferences-desktop-appearance-symbolic", "Nenhum tema instalado",
                               "Baixe temas no Explorar.", "Explorar temas", lambda: self._go_explore("gtk")))
         holder.append(grid)
         grid.set_loading(True)
 
         def add(theme):
-            dark = is_dark(pals[theme.name])
-            grid.add(theme.name, window_preview(pals[theme.name], 230, 130), pretty(theme.name),
-                     "Escuro" if dark else "Claro", tags={"escuro" if dark else "claro"})
-        add_batched(self.themes.values(), add, lambda: (grid.set_loading(False), self.refresh_marks()))
+            pal = theme_palette(theme)
+            tone = "escuro" if is_dark(pal) else "claro"
+            tags.add(tone)
+            grid.add(theme.name, window_preview(pal, 230, 130), pretty(theme.name),
+                     "Escuro" if tone == "escuro" else "Claro", tags={tone})
+        add_batched(self.themes.values(), add,
+                    lambda: (grid.set_filters(self._tone_filters(tags)), grid.set_loading(False), self.refresh_marks()))
 
     def _detail_temas(self, key):
         theme = self.themes.get(key)
@@ -3319,8 +3551,7 @@ class Window(Adw.ApplicationWindow):
                     lambda: (grid.set_loading(False), self.refresh_marks()))
 
     def _detail_icones(self, key):
-        imgs = [Gtk.Image(paintable=p, pixel_size=48) for p in icon_paintables(key, 48)]
-        return dict(preview=labeled_samples(imgs, ICON_LABELS, 48),
+        return dict(preview=labeled_samples(icon_images(key, 48), ICON_LABELS, 48),
                     caption="Ícones de verdade do tema, sempre os mesmos aplicativos para comparar.",
                     title=pretty(key), subtitle="Tema de ícones", notes=limitations("icones", self.env()),
                     in_use=self.desk.current()["icons"] == key)
@@ -3341,8 +3572,7 @@ class Window(Adw.ApplicationWindow):
         path = self.cursors.get(key)
         if not path:
             return None
-        imgs = [Gtk.Image(paintable=t, pixel_size=48) if t else None for t in cursor_textures(path, 48, 4)]
-        return dict(preview=labeled_samples(imgs, CURSOR_LABELS[:4], 48),
+        return dict(preview=labeled_samples(cursor_images(path, 48, 4, 48), CURSOR_LABELS[:4], 48),
                     caption="Imagens tiradas dos arquivos do cursor (a primeira imagem das animadas).",
                     title=pretty(key), subtitle="Cursor", notes=limitations("cursor", self.env()),
                     in_use=self.desk.current()["cursor"] == key)
@@ -3752,7 +3982,7 @@ class Window(Adw.ApplicationWindow):
                      kind=item["kind"], below=mark)
             self.store_status[item["id"]] = pill
             self.marked[item["id"]] = mark
-            self.store.preview(item, lambda f, pic=pic: pic.set_paintable(thumb_texture(f, 230, 130)))
+            self.store.preview(item, lambda f, pic=pic: load_async(pic, f, 230, 130))
         self._store_refresh()
 
     def _store_refresh(self):
@@ -3838,7 +4068,7 @@ class Window(Adw.ApplicationWindow):
             return None
         pic = picture("contain", width_request=340, height_request=190, css_classes=["studio-thumb"],
                       overflow=Gtk.Overflow.HIDDEN)
-        self.store.preview(item, lambda f: pic.set_paintable(thumb_texture(f, 340, 190)))
+        self.store.preview(item, lambda f: load_async(pic, f, 340, 190))
         installed = self.store.is_installed(item)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         for label, value in (("Autor", item.get("author", "—")), ("Licença", item.get("license", "—")),
@@ -4114,5 +4344,4 @@ class App(Adw.Application):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(App().run(sys.argv))

@@ -41,6 +41,7 @@ Rosé Pine, Kanagawa e Tokyo Night.
 ./studio run      # abre o app direto do código
 ./studio test     # testes automatizados
 ./studio docker   # instala o .deb num Ubuntu 22.04 e 24.04 limpos e testa
+./studio carga    # teste de carga: muitos temas, ícones e fotos; mede travadas e memória
 ./studio bundles  # gera os pacotes da Loja
 ./studio deb      # gera o .deb
 ```

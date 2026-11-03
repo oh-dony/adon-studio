@@ -17,6 +17,13 @@ case "$1" in
   deb)     # gera o .deb em dist/
     packaging/build-deb.sh
     ;;
+  carga)   # teste de carga: temas, ícones e fotos deste PC multiplicados (padrão 3x); mede travadas e memória
+    D=:$((90 + RANDOM % 9))
+    gtk4-broadwayd "$D" >/dev/null 2>&1 & BW=$!
+    trap 'kill $BW 2>/dev/null' EXIT
+    sleep 1
+    GDK_BACKEND=broadway BROADWAY_DISPLAY="$D" python3 -u packaging/test/carga.py "${2:-3}" 2> >(grep -v -E 'WARNING|^\s*$' >&2)
+    ;;
   docker)  # instala o .deb num Ubuntu limpo e roda o teste de fumaça (padrão: 22.04 e 24.04)
     DEB=$(packaging/build-deb.sh)
     for img in ${2:-ubuntu:22.04 ubuntu:24.04}; do

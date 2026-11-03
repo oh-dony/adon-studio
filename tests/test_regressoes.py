@@ -430,3 +430,173 @@ class TemasOcultosForaDaLista(unittest.TestCase):
         temas = A.list_icon_themes()
         self.assertNotIn("Oculto-Teste", temas)
         self.assertIn("Visivel-Teste", temas)
+
+
+def tema_icones(nome, dirs, arquivos, inherits=None):
+    """dirs: {pasta: entradas do index.theme}; arquivos: caminhos relativos a criar."""
+    d = A.USER_DATA / "icons" / nome
+    d.mkdir(parents=True, exist_ok=True)
+    idx = f"[Icon Theme]\nName={nome}\nDirectories={','.join(dirs)}\n"
+    if inherits:
+        idx += f"Inherits={inherits}\n"
+    for pasta, chaves in dirs.items():
+        idx += f"\n[{pasta}]\n" + "".join(f"{k}={v}\n" for k, v in chaves.items())
+    (d / "index.theme").write_text(idx)
+    for f in arquivos:
+        (d / f).parent.mkdir(parents=True, exist_ok=True)
+        (d / f).write_text("<svg/>")
+    return d
+
+
+class BuscaDeIconesSemGtk(unittest.TestCase):
+    """
+    Regressão (teste de carga): a aba Ícones deixava o app com +260 MB e travava a janela. Cada
+    prévia carregava o tema com um Gtk.IconTheme, e o GTK não devolve a memória ao soltar o tema
+    (~3 MB por tema, 7 MB no Papirus, a cada vez). A prévia agora acha os arquivos seguindo a
+    especificação de temas de ícones (freedesktop), só conferindo se o arquivo existe.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pai = tema_icones("Busca-Pai", {"32x32/places": {"Size": 32, "Type": "Fixed"},
+                                            "scalable/apps": {"Size": 64, "Type": "Scalable", "MinSize": 8,
+                                                              "MaxSize": 512}},
+                              ["32x32/places/folder.png", "scalable/apps/utilities-terminal.svg"])
+        cls.filho = tema_icones("Busca-Filho", {"16x16/places": {"Size": 16, "Type": "Fixed"},
+                                                "48x48/places": {"Size": 48, "Type": "Fixed"},
+                                                "24/places": {"Size": 24}},
+                                ["16x16/places/folder.png", "48x48/places/folder.png", "24/places/user-home.svg"],
+                                inherits="Busca-Pai")
+
+    def test_tamanho_exato_e_depois_o_mais_proximo_no_proprio_tema(self):
+        self.assertEqual(A.find_icon("Busca-Pai", ["folder"], 32), str(self.pai / "32x32/places/folder.png"))
+        # o tema escolhido vem antes do pai, mesmo sem o tamanho exato
+        self.assertEqual(A.find_icon("Busca-Filho", ["folder"], 40), str(self.filho / "48x48/places/folder.png"))
+        self.assertEqual(A.find_icon("Busca-Filho", ["folder"], 18), str(self.filho / "16x16/places/folder.png"))
+
+    def test_limiar_padrao_e_escalavel(self):
+        # Type padrão é Threshold (limiar 2): 24 serve para 22..26
+        self.assertEqual(A.find_icon("Busca-Filho", ["user-home"], 26), str(self.filho / "24/places/user-home.svg"))
+        self.assertEqual(A.find_icon("Busca-Pai", ["utilities-terminal"], 300),
+                         str(self.pai / "scalable/apps/utilities-terminal.svg"))
+
+    def test_nomes_alternativos_e_tema_pai(self):
+        self.assertEqual(A.find_icon("Busca-Filho", ["nao-existe", "utilities-terminal"], 32),
+                         str(self.pai / "scalable/apps/utilities-terminal.svg"))
+
+    def test_sem_icone_e_sem_tema(self):
+        self.assertIsNone(A.find_icon("Busca-Filho", ["nada-disso"], 32))
+        self.assertIsNone(A.find_icon("Tema-Que-Nao-Existe", ["folder"], 32))
+
+    def test_heranca_em_ciclo_nao_trava(self):
+        tema_icones("Ciclo-A", {"a": {"Size": 32}}, [], inherits="Ciclo-B")
+        tema_icones("Ciclo-B", {"a": {"Size": 32}}, [], inherits="Ciclo-A")
+        self.assertIsNone(A.find_icon("Ciclo-A", ["folder"], 32))
+
+
+class MemoriaDasMiniaturas(unittest.TestCase):
+    """
+    Regressão (teste de carga): abrir a aba Papel de parede com 80 imagens deixava o app com
+    +150 MB, para 5 MB de miniaturas. Cada imagem grande é decodificada inteira antes de reduzir;
+    o glibc sobe sozinho o limite de mmap depois do primeiro buffer grande e passa a guardar os
+    seguintes no heap das threads, sem devolver ao sistema.
+    """
+
+    def test_decodificar_imagens_grandes_nao_retem_memoria(self):
+        import subprocess
+        import sys
+        codigo = f"""
+import sys; sys.path[:0] = {[str(base.ROOT / 'tests'), str(base.ROOT)]!r}
+import base, adon_studio as A
+from gi.repository import GdkPixbuf
+f = base.TMP / 'grande.png'
+GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 3000, 2000).savev(str(f), 'png', [], [])
+def anon():
+    return int([l for l in open('/proc/self/status') if l.startswith('RssAnon')][0].split()[1]) // 1024
+antes = anon()
+list(A.POOL.map(lambda _i: A.thumb_texture(f, 230, 130), range(40)))
+print(anon() - antes)
+"""
+        out = subprocess.run([sys.executable, "-c", codigo], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertLess(int(out.stdout.split()[-1]), 60, "MB presos depois de reduzir 40 imagens 3000×2000")
+
+
+class TelaNaoEsperaAsThreads(unittest.TestCase):
+    """
+    Regressão (teste de carga): com uma thread de fundo ocupada (achar ícones, ler o catálogo),
+    300 chamadas ao GTK levavam 143 ms em vez de 0,1 ms e cliques travavam a janela. Cada
+    chamada ao GTK solta o GIL e precisa pegá-lo de volta; com o intervalo padrão do Python (5 ms)
+    a tela principal esperava a thread de fundo a cada chamada.
+    """
+
+    def test_intervalo_do_gil_curto(self):
+        import sys
+        self.assertLessEqual(sys.getswitchinterval(), 0.0005)
+
+
+class MiniaturasDoSistema(unittest.TestCase):
+    """
+    Regressão (teste de carga): a aba Papel de parede decodificava cada foto inteira toda vez que
+    abria (o JPEG não sai reduzido: uma foto 6144×4292 ocupa 100 MB por um instante, quatro ao
+    mesmo tempo davam picos de ~350 MB). Agora usa a miniatura do padrão freedesktop em
+    ~/.cache/thumbnails (a mesma que o app Arquivos já criou) e cria a que faltar.
+    """
+
+    def foto(self, nome, w=2000, h=1000):
+        from gi.repository import GdkPixbuf
+        f = base.TMP / nome
+        pb = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, w, h)
+        pb.fill(0x2040a0ff)
+        pb.savev(str(f), "jpeg", [], [])
+        return f
+
+    def miniatura(self, f):
+        import hashlib
+        from gi.repository import Gio
+        uri = Gio.File.new_for_path(str(f)).get_uri()
+        return A.THUMBS / "large" / (hashlib.md5(uri.encode()).hexdigest() + ".png"), uri
+
+    def test_cria_a_miniatura_no_padrao(self):
+        from gi.repository import GdkPixbuf
+        f = self.foto("nova.jpg")
+        tex = A.thumb_texture(f, 230, 130)
+        self.assertLessEqual(tex.get_width(), 230)
+        thumb, uri = self.miniatura(f)
+        self.assertTrue(thumb.exists(), "miniatura gravada em ~/.cache/thumbnails/large")
+        pb = GdkPixbuf.Pixbuf.new_from_file(str(thumb))
+        self.assertEqual(max(pb.get_width(), pb.get_height()), 256)
+        self.assertEqual(pb.get_option("tEXt::Thumb::URI"), uri)
+        self.assertEqual(pb.get_option("tEXt::Thumb::MTime"), str(int(f.stat().st_mtime)))
+
+    def test_usa_a_miniatura_que_ja_existe_sem_abrir_a_foto(self):
+        import os
+        from gi.repository import GdkPixbuf
+        f = self.foto("ja-tem.jpg")
+        thumb, uri = self.miniatura(f)
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        vermelha = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 256, 128)
+        vermelha.fill(0xff0000ff)
+        vermelha.savev(str(thumb), "png", ["tEXt::Thumb::URI", "tEXt::Thumb::MTime"],
+                       [uri, str(int(f.stat().st_mtime))])
+        original = GdkPixbuf.Pixbuf.new_from_file_at_scale
+
+        def proibido(*_a):
+            raise AssertionError("abriu a foto original")
+        GdkPixbuf.Pixbuf.new_from_file_at_scale = proibido
+        try:
+            tex = A.thumb_texture(f, 230, 130)
+        finally:
+            GdkPixbuf.Pixbuf.new_from_file_at_scale = original
+        self.assertEqual(tex.get_width(), 230)
+        # miniatura velha (a foto mudou depois): faz de novo a partir da foto
+        os.utime(f, (f.stat().st_atime, f.stat().st_mtime + 10))
+        A.thumb_texture(f, 230, 130)
+        pb = GdkPixbuf.Pixbuf.new_from_file(str(thumb))
+        self.assertEqual(pb.get_option("tEXt::Thumb::MTime"), str(int(f.stat().st_mtime)))
+        self.assertNotEqual(pb.get_pixels()[:3], b"\xff\x00\x00", "trocou a miniatura velha")
+
+    def test_imagem_pequena_nao_ganha_miniatura(self):
+        f = self.foto("pequena.jpg", 400, 200)
+        A.thumb_texture(f, 230, 130)
+        self.assertFalse(self.miniatura(f)[0].exists())

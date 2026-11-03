@@ -39,12 +39,16 @@ no fim deste arquivo. Nunca deixe isso passar em silêncio.
 | Pacote da Loja incompleto, atalho quebrado, catálogo | `tests/test_regressoes.py` (usa `packaging/build_bundles.py`) | `./studio test` |
 | Interface: tamanho, layout, widget | `tests/test_ui.py` (pulado sem tela) | `./studio test` numa sessão gráfica |
 | Não instala ou não abre num Ubuntu limpo, dependência faltando, API de GTK/libadwaita antiga | `packaging/test/teste_app.py` no Docker | `./studio docker` |
+| Janela travando, lenta ou gastando muita memória com muitos temas/fotos | `packaging/test/carga.py`: HOME isolado com os temas, ícones e fotos deste PC multiplicados; falha com travada > 250 ms ou memória final > 400 MB. A causa vira teste em `tests/` | `./studio carga [multiplicador]` (≈1 min) |
 | Num sistema recém-instalado o combo não pega em tudo (painel, Nautilus, extensão, wallpaper) | `packaging/test/gnome/verifica.py`: GNOME Shell de verdade sem tela no Docker (Ubuntu 22.04, 24.04, Pop!_OS 22.04) | `./studio gnome` (≈5 min por sistema; a 1ª vez monta as imagens, ≈15 min) |
 
 Dicas:
 - `tests/base.py` isola tudo: HOME e pastas XDG temporárias, GSettings em memória e um
   esquema falso da barra. **Importe `base` antes do `adon_studio`.** Nunca teste
   mexendo no tema do computador de verdade.
+- **Nada pesado na tela principal**: ler arquivo de tema, ícone, cursor ou foto e desenhar SVG vão
+  para o `POOL` (ou `ICON_POOL`) e voltam com `GLib.idle_add`. Prévia de ícone usa `icon_images`/
+  `find_icon`, nunca um `Gtk.IconTheme` novo (o GTK não devolve a memória de um tema ao soltá-lo).
 - `monitor_ids()` fala com o Mutter por D-Bus: nos testes, substitua por uma lambda.
 - A Loja aceita `ADON_STUDIO_CATALOG` com `file://` ou `http://localhost` — nunca
   dependa do GitHub num teste.

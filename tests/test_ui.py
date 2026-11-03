@@ -478,3 +478,219 @@ class RespiroNasBordas(unittest.TestCase):
         self.assertGreaterEqual(conteudo.get_margin_start(), 6)
         self.assertGreaterEqual(win.footer.get_margin_start(), 12)
         self.assertGreaterEqual(win.pending_box.get_margin_start(), 12)
+
+
+def tema_de_icones(nome):
+    """Tema de ícones mínimo (sem icon-theme.cache, como o Papirus e o Catppuccin da Loja)."""
+    d = A.USER_DATA / "icons" / nome
+    (d / "32x32" / "places").mkdir(parents=True, exist_ok=True)
+    (d / "index.theme").write_text("[Icon Theme]\nName=%s\nDirectories=32x32/places\n\n"
+                                   "[32x32/places]\nSize=32\nContext=Places\nType=Fixed\n" % nome)
+    (d / "32x32" / "places" / "folder.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" '
+        'fill="#e01b24"/></svg>')
+    return d
+
+
+@unittest.skipUnless(TEM_TELA, "precisa de tela (rode numa sessão gráfica ou com GDK_BACKEND=broadway)")
+class IconesForaDaTelaPrincipal(unittest.TestCase):
+    """
+    Regressão (teste de carga): abrir o app congelava a janela por ~2 s e a aba Ícones travava
+    por ~3,5 s com os temas da Loja instalados. Cada prévia (cartão, painel e dock dos Estilos)
+    criava um Gtk.IconTheme novo e a primeira busca nele lê a pasta inteira do tema (0,2–0,3 s no
+    Papirus e no Catppuccin, que não têm icon-theme.cache), tudo na tela principal. E o GTK não
+    devolve a memória do tema ao soltá-lo: as prévias não usam mais o Gtk.IconTheme.
+    """
+
+    def test_previa_de_icones_nao_trava_nem_carrega_o_tema_no_gtk(self):
+        import threading
+        tema_de_icones("Carga-Icones")
+        principal, threads = threading.current_thread(), []
+        original = Gtk.IconTheme.lookup_icon
+
+        def espia(theme, *args):
+            threads.append(threading.current_thread())
+            return original(theme, *args)
+        Gtk.IconTheme.lookup_icon = espia
+        try:
+            pal = tuple(map(A.rgba, ("#202020", "#303030", "#ffffff", "#3584e4")))
+            card = A.icon_preview("Carga-Icones")
+            dock = A.desktop_preview(None, pal, "Carga-Icones", 250, 140)
+            imagens = imagens_em(card) + imagens_em(dock)
+            self.assertTrue(imagens)
+            self.assertTrue(espera(lambda: all(i.get_storage_type() != Gtk.ImageType.EMPTY for i in imagens)),
+                            "os ícones aparecem depois de carregados")
+        finally:
+            Gtk.IconTheme.lookup_icon = original
+        self.assertNotIn(principal, threads, "buscar ícone no tema trava a janela")
+        self.assertEqual(threads, [], "o Gtk.IconTheme prende a memória do tema")
+        self.assertIsInstance(imagens_em(card)[0].get_paintable(), Gdk.Texture, "o ícone do tema, não o de faltando")
+
+
+def imagens_em(widget):
+    out, stack = [], [widget]
+    while stack:
+        w = stack.pop()
+        if isinstance(w, Gtk.Image):
+            out.append(w)
+        child = w.get_first_child()
+        while child:
+            stack.append(child)
+            child = child.get_next_sibling()
+    return out
+
+
+@unittest.skipUnless(TEM_TELA, "precisa de tela (rode numa sessão gráfica ou com GDK_BACKEND=broadway)")
+class CliqueSoMexeNoQueMudou(unittest.TestCase):
+    """
+    Regressão (teste de carga): com ~500 cartões abertos, cada clique travava a janela por até
+    0,13 s. Marcar o “Em uso” e o selecionado reescrevia dica e texto de acessibilidade de todos os
+    cartões de todas as abas, mesmo os que não mudaram.
+    """
+
+    def test_marcar_e_selecionar_so_atualiza_os_cartoes_afetados(self):
+        grid = A.Grid(lambda key: None)
+        for i in range(100):
+            grid.add(f"c{i}", Gtk.Box(), f"Cartão {i}")
+        grid.mark("c1")
+        grid.select({"c2"})
+        tocados = []
+        original = grid._describe
+        grid._describe = lambda k: (tocados.append(k), original(k))
+        grid.mark("c1")
+        grid.select({"c2"})
+        self.assertEqual(tocados, [], "nada mudou: nenhum cartão precisa ser reescrito")
+        grid.mark("c3")
+        grid.select({"c4"})
+        self.assertEqual(sorted(tocados), ["c1", "c2", "c3", "c4"])
+        self.assertTrue(grid.cards["c3"].badge.get_visible())
+        self.assertFalse(grid.cards["c1"].badge.get_visible())
+        self.assertTrue(grid.cards["c4"].check.get_visible())
+        self.assertFalse(grid.cards["c2"].check.get_visible())
+        self.assertIn("em uso", grid.cards["c3"].get_tooltip_text())
+        self.assertNotIn("em uso", grid.cards["c1"].get_tooltip_text())
+
+
+@unittest.skipUnless(TEM_TELA, "precisa de tela (rode numa sessão gráfica ou com GDK_BACKEND=broadway)")
+class PreviasCarregamForaDaTelaPrincipal(unittest.TestCase):
+    """
+    Regressão (teste de carga): montar a aba Cursores travava a janela (arquivos Xcursor de até
+    alguns MB lidos na hora), a aba Cores travava ~90 ms (o SVG do papel de parede era gerado e
+    desenhado na tela principal) e a Explorar ~120 ms (a miniatura chegava do fundo mas era
+    decodificada na tela principal).
+    """
+
+    def espiar(self, nome):
+        import threading
+        original, chamadas = getattr(A, nome), []
+
+        def espia(*args, **kw):
+            chamadas.append(threading.current_thread() is threading.main_thread())
+            return original(*args, **kw)
+        setattr(A, nome, espia)
+        self.addCleanup(setattr, A, nome, original)
+        return chamadas
+
+    def test_cursor(self):
+        d = A.USER_DATA / "icons" / "Cursor-Previa" / "cursors"
+        d.mkdir(parents=True, exist_ok=True)
+        import struct
+        px = b"\xff\x00\x00\xff" * 32 * 32
+        (d / "left_ptr").write_bytes(b"Xcur" + struct.pack("<III", 16, 0x10000, 1) +
+                                     struct.pack("<III", 0xFFFD0002, 32, 28) +
+                                     struct.pack("<IIIIIIIII", 36, 0xFFFD0002, 32, 1, 32, 32, 0, 0, 0) + px)
+        chamadas = self.espiar("load_xcursor")
+        box = A.cursor_preview(d.parent)
+        self.assertNotIn(True, chamadas, "ler o arquivo do cursor trava a janela")
+        imgs = imagens_em(box)
+        self.assertTrue(espera(lambda: all(i.get_storage_type() != Gtk.ImageType.EMPTY for i in imgs)))
+        self.assertTrue(any(isinstance(i.get_paintable(), A.Gdk.Texture) for i in imgs), "o ponteiro aparece")
+        self.assertEqual(chamadas and set(chamadas), {False})
+
+    def test_paleta(self):
+        chamadas = self.espiar("svg_texture")
+        p = A.make_palettes("#e01b24")[0]
+        p.update(design="montanhas", seed=0)
+        prev = A.Window._palette_preview(p, 250, 140)
+        pic = prev.get_child()
+        self.assertNotIn(True, chamadas, "desenhar o papel de parede trava a janela")
+        self.assertTrue(espera(lambda: pic.get_paintable() is not None))
+        self.assertEqual(set(chamadas), {False})
+
+    def test_miniatura_do_explorar(self):
+        from gi.repository import GdkPixbuf
+        win = janela()
+        (A.CACHE / "previews").mkdir(parents=True, exist_ok=True)
+        GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 480, 270).savev(
+            str(A.CACHE / "previews" / "x.png"), "png", [], [])
+        win.store.items = {"x": dict(id="x", kind="gtk", title="Tema X", author="A", bytes=1, dirs=["X"],
+                                     preview="x.png", file="x.tar.xz")}
+        win.store_loading = False
+        chamadas = self.espiar("thumb_texture")
+        win.go("explorar")
+        win.rebuild("explorar")
+        self.assertTrue(espera(lambda: bool(chamadas)), "a miniatura chega")
+        espera(lambda: False, 0.3)
+        self.assertEqual(set(chamadas), {False}, "decodificar a miniatura trava a janela")
+
+
+@unittest.skipUnless(TEM_TELA, "precisa de tela (rode numa sessão gráfica ou com GDK_BACKEND=broadway)")
+class GradeGrandeSemTravar(unittest.TestCase):
+    """
+    Regressão (teste de carga): com ~140 temas instalados, abrir a aba Temas parava a janela:
+    as cores de todos os temas eram lidas de uma vez antes de mostrar o primeiro cartão (75 ms), e
+    cada cartão nascia com o véu de “carregando” (caixa, pilha, spinner e ícone) que quase nunca
+    aparece, deixando o primeiro desenho da grade bem mais pesado.
+    """
+
+    def test_cores_dos_temas_lidas_aos_poucos(self):
+        for i in range(12):
+            tema(f"Grade-{i:02d}-Dark" if i % 2 else f"Grade-{i:02d}-Light")
+        lidas = []
+        original = A.theme_palette
+        A.theme_palette = lambda t: (lidas.append(t.name), original(t))[1]
+        self.addCleanup(setattr, A, "theme_palette", original)
+        win = janela()
+        lidas.clear()
+        win.go("temas")
+        self.assertLessEqual(len(lidas), 8, "leu as cores de todos os temas antes de mostrar a aba")
+        self.assertTrue(espera(lambda: not win.grids["temas"].loading))
+        self.assertIn("Escuros", textos(win.grids["temas"]), "o filtro Escuros/Claros aparece no fim")
+
+    def test_veu_so_quando_carrega(self):
+        grid = A.Grid(lambda key: None)
+        card = grid.add("a", Gtk.Box(), "Tema A")
+        self.assertIsNone(card.veil, "cartão parado não precisa do véu")
+        grid.start("a")
+        self.assertTrue(card.veil.get_visible())
+        grid.finish("a")
+        self.assertEqual(card.veil_stack.get_visible_child_name(), "ok")
+        outro = grid.add("b", Gtk.Box(), "Tema B")
+        grid.finish("b")  # cartão recriado depois de um download: finish sem start
+        self.assertTrue(outro.veil.get_visible())
+
+
+class CacheQueEsquece(dict):
+    """Simula o _scan() esvaziando o cache logo depois de cada gravação (corrida com a thread)."""
+
+    def __setitem__(self, key, value):
+        pass
+
+
+@unittest.skipUnless(TEM_TELA, "precisa de tela (rode numa sessão gráfica ou com GDK_BACKEND=broadway)")
+class IconesComCacheEsvaziadoNoMeio(unittest.TestCase):
+    """
+    Regressão (achado na revisão do teste de carga): se o _scan() (depois de instalar um tema)
+    esvaziasse os caches de ícones enquanto a thread de fundo trabalhava, a leitura logo depois
+    da gravação dava KeyError, o erro sumia dentro do ThreadPoolExecutor e os ícones daquele
+    cartão nunca apareciam.
+    """
+
+    def test_icones_aparecem_mesmo_assim(self):
+        tema_de_icones("Corrida-Icones")
+        for nome in ("ICON_FILES", "ICON_HITS", "ICON_INDEX"):
+            self.addCleanup(setattr, A, nome, getattr(A, nome))
+            setattr(A, nome, CacheQueEsquece())
+        imgs = imagens_em(A.icon_preview("Corrida-Icones"))
+        self.assertTrue(espera(lambda: all(i.get_storage_type() != Gtk.ImageType.EMPTY for i in imgs)))
+        self.assertIsInstance(imgs[-1].get_paintable(), Gdk.Texture)
