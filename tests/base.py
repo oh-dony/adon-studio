@@ -52,6 +52,9 @@ def _blur_schemas():
 _schemas = _tmp / "schemas"
 _schemas.mkdir()
 (_schemas / "teste.gschema.xml").write_text("""<schemalist>
+  <schema id="org.gnome.shell.extensions.user-theme" path="/org/gnome/shell/extensions/user-theme/">
+    <key name="name" type="s"><default>''</default></key>
+  </schema>
   <schema id="org.gnome.shell.extensions.dash-to-panel" path="/org/gnome/shell/extensions/dash-to-panel/">
     <key name="panel-lengths" type="s"><default>'{}'</default></key>
     <key name="panel-anchors" type="s"><default>'{}'</default></key>

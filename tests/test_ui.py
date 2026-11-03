@@ -66,3 +66,19 @@ class MiniaturasDaLoja(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(TEM_TELA, "precisa de tela (rode numa sessão gráfica ou com GDK_BACKEND=broadway)")
+class BotaoOutraCor(unittest.TestCase):
+    """
+    Regressão: na aba Cores, depois de clicar na bolinha vermelha, o botão "Outra cor…" continuava
+    azul. Ele só recebia a cor de partida e não acompanhava a cor escolhida.
+    """
+
+    def test_acompanha_a_cor_escolhida(self):
+        from gi.repository import Adw
+        win = A.Window(Adw.Application(application_id="com.adonay.studio.teste"))
+        win.stack.set_visible_child_name("cores")
+        win._fill_palettes("#e01b24")
+        self.assertTrue(win.color_btn.get_rgba().equal(A.rgba("#e01b24")))
+        self.assertEqual(len(win.grids["cores"].cards), len(A.HARMONIES))

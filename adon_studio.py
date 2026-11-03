@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Adon Studio — personalize o visual do GNOME com um clique.
+import colorsys
 import hashlib
 import json
 import os
@@ -171,7 +172,7 @@ class Desktop:
         self.shell = settings_for("org.gnome.shell.extensions.user-theme")
         self.bar = next((s for s in map(settings_for, TASKBAR_SCHEMAS) if s), None)
         self.tracked = {
-            "interface": (self.iface, ["gtk-theme", "icon-theme", "cursor-theme", "color-scheme"]),
+            "interface": (self.iface, ["gtk-theme", "icon-theme", "cursor-theme", "color-scheme", "accent-color"]),
             "background": (self.bg, ["picture-uri", "picture-uri-dark", "picture-options"]),
             "screensaver": (self.lock, ["picture-uri"]),
             "user-theme": (self.shell, ["name"]),
@@ -308,6 +309,32 @@ class Desktop:
         self.bg.set_string("picture-options", "zoom")
         if self.lock:
             self.lock.set_string("picture-uri", uri)
+
+    def apply_palette(self, pal):
+        """Pinta o sistema com uma paleta da aba Cores: cor de destaque do GNOME (47+), cores dos apps
+        GTK4/libadwaita e um wallpaper gerado com as mesmas cores. A paleta troca a base em vez de ir
+        por cima do tema: muitos temas (Catppuccin...) têm as cores escritas direto no CSS e ignoram
+        @accent_bg_color, e um tema escuro com o modo claro ligado deixa o painel ilegível."""
+        dark = pal["dark"]
+        self.iface.set_string("color-scheme", "prefer-dark" if dark else "prefer-light")
+        # Zorin e Ubuntu trazem temas por cor com painel incluso (ZorinRed-Light, Yaru-red...): usa o
+        # mais parecido; sem eles, Adwaita nos apps GTK3 e o Shell padrão, que segue o claro/escuro
+        variant = system_variant(pal["accent"], dark, list_gtk_themes())
+        self.iface.set_string("gtk-theme", variant or ("Adwaita-dark" if dark else "Adwaita"))
+        if self.shell:
+            self.shell.set_string("name", variant or "")
+        self.iface.set_string("icon-theme", folder_icon_theme(pal, self.iface.get_string("icon-theme")))
+        if has_key(self.iface, "accent-color"):
+            self.iface.set_string("accent-color", gnome_accent(pal["accent"]))
+        self._clear_gtk4()
+        GTK4_CFG.mkdir(parents=True, exist_ok=True)
+        (GTK4_CFG / "gtk.css").write_text(palette_css(pal))
+        WALLS.mkdir(parents=True, exist_ok=True)
+        wall = WALLS / f"cor-{pal['accent'][1:]}-{pal['key']}.svg"
+        wall.write_text(wall_svg(*pal["wall"]))
+        self.apply_wallpaper(wall)
+        reload_files_app()
+        return wall
 
     # --- barra de tarefas (valores por monitor guardados em JSON)
     def bar_get(self, key, default):
@@ -970,6 +997,167 @@ def ensure_wallpapers():
             f.write_text(wall_svg(*colors))
 
 
+# ---------------------------------------------------------------- aba Cores: paletas a partir de uma cor
+
+FAVORITE_COLORS = [("Azul", "#3584e4"), ("Roxo", "#9141ac"), ("Rosa", "#e66197"), ("Vermelho", "#e01b24"),
+                   ("Laranja", "#ff7800"), ("Amarelo", "#f6d32d"), ("Verde", "#2ec27e"), ("Turquesa", "#2190a4"),
+                   ("Cinza", "#8a8f98")]
+# cores de destaque que o GNOME 47+ aceita em org.gnome.desktop.interface accent-color
+GNOME_ACCENTS = {"blue": "#3584e4", "teal": "#2190a4", "green": "#3a944a", "yellow": "#c88800",
+                 "orange": "#ed5b00", "red": "#e62d42", "pink": "#d56199", "purple": "#9141ac", "slate": "#6f8396"}
+# (chave, nome, giro do 2º tom em graus, escura?)
+HARMONIES = [("mono", "Monocromática", 0, True), ("analoga", "Análoga", 35, True),
+             ("complementar", "Complementar", 180, True), ("triade", "Tríade", 120, True),
+             ("clara", "Clara", 35, False)]
+PALETTE_START, PALETTE_END = f"/* {APP_NAME}: paleta */", f"/* {APP_NAME}: fim da paleta */"
+
+
+def hex_hls(text):
+    c = rgba(text)
+    return colorsys.rgb_to_hls(c.red, c.green, c.blue)
+
+
+def hls_hex(h, l, s):
+    r, g, b = colorsys.hls_to_rgb(h % 1, min(max(l, 0), 1), min(max(s, 0), 1))
+    return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+def luminance(text):
+    c = rgba(text)
+    lin = [v / 12.92 if v <= .04045 else ((v + .055) / 1.055) ** 2.4 for v in (c.red, c.green, c.blue)]
+    return .2126 * lin[0] + .7152 * lin[1] + .0722 * lin[2]
+
+
+def contrast(a, b):
+    la, lb = sorted((luminance(a), luminance(b)), reverse=True)
+    return (la + .05) / (lb + .05)
+
+
+def readable_on(bg):
+    return max(("#ffffff", "#000000"), key=lambda fg: contrast(fg, bg))
+
+
+def gnome_accent(text):
+    """A cor de destaque do GNOME mais parecida (pelo tom; cinza vira 'slate')."""
+    h, _l, s = hex_hls(text)
+    if s < .15:
+        return "slate"
+
+    def dist(item):
+        d = abs(hex_hls(item[1])[0] - h)
+        return min(d, 1 - d)
+    return min(((k, v) for k, v in GNOME_ACCENTS.items() if k != "slate"), key=dist)[0]
+
+
+def make_palettes(color):
+    """Paletas que combinam com a cor favorita: fundo, conteúdo, texto, destaque e wallpaper."""
+    h, l, s = hex_hls(color)
+    grey = s < .12
+    sat = 0 if grey else max(s, .55)
+    tint = 0 if grey else .22
+    out = []
+    for key, title, turn, dark in HARMONIES:
+        h2 = h + turn / 360
+        if dark:
+            accent = hls_hex(h, min(max(l, .5), .64), sat)
+            accent2 = hls_hex(h2, .72 if turn == 0 else .6, sat * (.6 if turn == 0 else 1))
+            bg, base, fg = hls_hex(h, .11, tint), hls_hex(h, .145, tint), hls_hex(h, .93, tint * .5)
+            wall = (hls_hex(h, .13, tint * 1.3), hls_hex(h, .05, tint), accent, accent2)
+        else:
+            accent = hls_hex(h, min(max(l, .36), .42), sat)
+            accent2 = hls_hex(h2, .5, sat)
+            bg, base, fg = hls_hex(h, .955, tint * 1.4), hls_hex(h, .99, tint), hls_hex(h, .13, tint)
+            wall = (hls_hex(h, .9, tint * 2), hls_hex(h, .76, tint * 2), accent, accent2)
+        out.append(dict(key=key, title=title, dark=dark, accent=accent, accent2=accent2, accent_fg=readable_on(accent),
+                        bg=bg, base=base, fg=fg, wall=wall))
+    return out
+
+
+SYSTEM_FAMILY = re.compile(r"^(Zorin[A-Z][a-z]+-(Light|Dark)|Yaru(-[a-z]+){0,2})$")
+
+
+def system_variant(accent, dark, themes):
+    """O tema de cor do sistema (com painel) mais parecido com a cor de destaque, ou None."""
+    cands = [t for t in themes if SYSTEM_FAMILY.match(t.name) and (t.path / "gnome-shell").is_dir()
+             and t.name.lower().endswith("-dark") == dark]
+    if not cands:
+        return None
+    h, _l, s = hex_hls(accent)
+    tones = {t.name: hex_hls(theme_palette(t)[3].to_string()) for t in cands}
+    if s < .15:
+        return min(tones, key=lambda n: tones[n][2])
+
+    def dist(name):
+        th, _tl, ts = tones[name]
+        d = abs(th - h)
+        return min(d, 1 - d) + abs(ts - s) * .15 + (1 if ts < .15 else 0)  # laranja vivo ≠ marrom
+    return min(tones, key=dist)
+
+
+FOLDER_PREFIX = "Adon-Pastas-"
+# desenho por cima da pasta (caminhos num quadro de 64x64)
+FOLDER_GLYPHS = {
+    "folder": "", "inode-directory": "", "folder-open": "", "folder-drag-accept": "", "folder-remote": "",
+    "folder-download": '<path d="M32 31v12M26.5 38l5.5 5.5 5.5-5.5M25 48h14" class="l"/>',
+    "folder-documents": '<path d="M25 33h14M25 39h14M25 45h9" class="l"/>',
+    "folder-music": '<path d="M36 31v13" class="l"/><circle cx="32" cy="45" r="4" class="f"/>',
+    "folder-pictures": '<path d="M24 47l6-7 4 4 3-3 5 6z" class="f"/><circle cx="37" cy="34" r="2.5" class="f"/>',
+    "folder-videos": '<path d="M29 33v12l10-6z" class="f"/>',
+    "folder-publicshare": '<circle cx="32" cy="35" r="3.5" class="f"/><path d="M25 47c0-4 3-6.5 7-6.5s7 2.5 7 6.5" class="l"/>',
+    "folder-templates": '<rect x="25" y="31" width="14" height="16" rx="1.5" class="l"/><path d="M28 36h8M28 41h8" class="l"/>',
+    "user-home": '<path d="M24.5 40l7.5-7.5 7.5 7.5M27 38v9h10v-9" class="l"/>',
+    "user-desktop": '<rect x="24" y="32" width="16" height="11" rx="1.5" class="l"/><path d="M29 47h6" class="l"/>',
+}
+
+
+def folder_svg(front, back, glyph):
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
+            f'<style>.l{{fill:none;stroke:{back};stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}}'
+            f'.f{{fill:{back}}}</style>'
+            f'<path d="M6 14a4 4 0 0 1 4-4h13.5l5.5 5h25a4 4 0 0 1 4 4v31H6z" fill="{back}"/>'
+            f'<rect x="6" y="21" width="52" height="34" rx="4" fill="{front}"/>{glyph}</svg>\n')
+
+
+def folder_icon_theme(pal, current):
+    """Tema de ícones com as pastas na cor da paleta; o resto vem do tema de ícones atual. Nome novo
+    a cada cor (os apps só recarregam os ícones quando o nome muda) e o anterior é apagado."""
+    root = USER_DATA / "icons"
+    if current.startswith(FOLDER_PREFIX):  # já é uma pasta colorida: herda do tema de verdade
+        index = root / current / "index.theme"
+        m = re.search(r"^Inherits=([^,\n]+)", index.read_text(), re.M) if index.exists() else None
+        current = m.group(1) if m else "Adwaita"
+    name = f"{FOLDER_PREFIX}{pal['accent'][1:]}-{'escuro' if pal['dark'] else 'claro'}"
+    for old in root.glob(f"{FOLDER_PREFIX}*"):
+        if old.name != name:
+            shutil.rmtree(old, ignore_errors=True)
+    places = root / name / "scalable" / "places"
+    places.mkdir(parents=True, exist_ok=True)
+    h, l, s = hex_hls(pal["accent"])
+    front, back = pal["accent"], hls_hex(h, l * .62, s)
+    for icon, glyph in FOLDER_GLYPHS.items():
+        (places / f"{icon}.svg").write_text(folder_svg(front, back, glyph))
+    (root / name / "index.theme").write_text(
+        f"[Icon Theme]\nName={name}\nComment={APP_NAME}: pastas na cor da paleta\n"
+        f"Inherits={current},Adwaita,hicolor\nHidden=true\nDirectories=scalable/places\n\n"
+        f"[scalable/places]\nSize=64\nMinSize=8\nMaxSize=512\nType=Scalable\nContext=Places\n")
+    return name
+
+
+def palette_css(pal):
+    h, l, s = hex_hls(pal["bg"])
+    side = hls_hex(h, l + (.03 if pal["dark"] else -.03), s)
+    colors = {
+        "accent_color": pal["accent"], "accent_bg_color": pal["accent"],
+        "accent_fg_color": pal["accent_fg"], "window_bg_color": pal["bg"], "window_fg_color": pal["fg"],
+        "view_bg_color": pal["base"], "view_fg_color": pal["fg"], "headerbar_bg_color": side,
+        "headerbar_fg_color": pal["fg"], "sidebar_bg_color": side, "sidebar_fg_color": pal["fg"],
+        "popover_bg_color": pal["base"], "popover_fg_color": pal["fg"], "dialog_bg_color": pal["bg"],
+        "dialog_fg_color": pal["fg"], "card_fg_color": pal["fg"],
+    }
+    lines = "".join(f"@define-color {k} {v};\n" for k, v in colors.items())
+    return f"{PALETTE_START}\n{lines}{PALETTE_END}\n"
+
+
 # ---------------------------------------------------------------- interface
 
 CSS = """
@@ -1168,6 +1356,11 @@ class Grid(Gtk.Box):
         btn.veil.set_visible(True)  # o cartão pode ter sido recriado depois de um download
         GLib.timeout_add(900, lambda: btn.veil.set_visible(False) or False)
 
+    def clear(self):
+        while child := self.flow.get_first_child():
+            self.flow.remove(child)
+        self.cards, self.working = {}, None
+
     def mark(self, key):
         for k, btn in self.cards.items():
             (btn.add_css_class if k == key else btn.remove_css_class)("atual")
@@ -1196,6 +1389,7 @@ def add_batched(items, fn, done=None):
 class Window(Adw.ApplicationWindow):
     PAGES = [
         ("combos", "Combos", "view-grid-symbolic", "_build_combos"),
+        ("cores", "Cores", "applications-graphics-symbolic", "_build_colors"),
         ("temas", "Temas", "preferences-desktop-appearance-symbolic", "_build_themes"),
         ("icones", "Ícones", "folder-pictures-symbolic", "_build_icons"),
         ("cursores", "Cursores", "input-mouse-symbolic", "_build_cursors"),
@@ -1413,6 +1607,61 @@ class Window(Adw.ApplicationWindow):
         if p["cursor"] in self.cursors:
             self.desk.apply_cursor(p["cursor"])
         self.desk.apply_wallpaper(WALLS / f"{p['wall']}.svg")
+
+    # --- cores
+    def _build_colors(self, holder):
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_start=18, margin_end=18, margin_top=16)
+        top.append(Gtk.Label(label="Qual é a sua cor favorita?", xalign=0, css_classes=["title-2"]))
+        top.append(Gtk.Label(label="A gente monta paletas que combinam com ela: as cores das janelas, o destaque "
+                                   "do sistema e um wallpaper novo.", xalign=0, wrap=True, css_classes=["dim-label"]))
+        row = Gtk.Box(spacing=8, margin_top=8)
+        for name, hexa in FAVORITE_COLORS:
+            dot = drawing(30, 30, lambda cr, w, h, c=rgba(hexa): (_src(cr, c), cr.arc(w / 2, h / 2, w / 2, 0, 2 * pi),
+                                                                cr.fill()))
+            btn = Gtk.Button(child=dot, tooltip_text=name, css_classes=["flat", "circular"])
+            btn.connect("clicked", lambda _b, c=hexa: self._fill_palettes(c))
+            row.append(btn)
+        if hasattr(Gtk, "ColorDialogButton"):
+            other = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False), tooltip_text="Outra cor…",
+                                          rgba=rgba(getattr(self, "fav_color", FAVORITE_COLORS[0][1])))
+            other.connect("notify::rgba", lambda b, _p: self._fill_palettes(b.get_rgba().to_string()))
+        else:
+            other = Gtk.ColorButton(use_alpha=False, tooltip_text="Outra cor…",
+                                    rgba=rgba(getattr(self, "fav_color", FAVORITE_COLORS[0][1])))
+            other.connect("color-set", lambda b: self._fill_palettes(b.get_rgba().to_string()))
+        other.set_valign(Gtk.Align.CENTER)
+        self.color_btn = other
+        row.append(other)
+        top.append(row)
+        holder.append(top)
+        self.grids["cores"] = Grid(self._pick_palette, search=False)
+        holder.append(self.grids["cores"])
+        self._fill_palettes(getattr(self, "fav_color", FAVORITE_COLORS[0][1]))
+
+    def _fill_palettes(self, color):
+        grid = self.grids.get("cores")
+        if not grid or grid.working:  # a grade ainda não existe enquanto a aba está sendo montada
+            return
+        if grid.cards and rgba(color).equal(rgba(self.fav_color)):
+            return
+        self.fav_color = color
+        if not self.color_btn.get_rgba().equal(rgba(color)):  # o botão mostra a cor escolhida
+            self.color_btn.set_rgba(rgba(color))
+        grid.clear()
+        self.palettes = {p["key"]: p for p in make_palettes(color)}
+        for p in self.palettes.values():
+            pal = tuple(map(rgba, (p["bg"], p["base"], p["fg"], p["accent"])))
+
+            def paint(cr, w, h, pal=pal, wall=p["wall"]):
+                draw_backdrop(cr, w, h, wall)
+                draw_window(cr, 26, 22, w - 52, h - 44, pal)
+            grid.add(p["key"], drawing(260, 160, paint), p["title"],
+                     f"{'Escura' if p['dark'] else 'Clara'} · {p['accent']} + {p['accent2']}")
+
+    def _pick_palette(self, key):
+        p = self.palettes[key]
+        self._feedback("cores", key, lambda: self.desk.apply_palette(p),
+                       f"Paleta {p['title']} aplicada — apps abertos podem precisar ser reabertos")
 
     # --- temas
     def _build_themes(self, holder):
