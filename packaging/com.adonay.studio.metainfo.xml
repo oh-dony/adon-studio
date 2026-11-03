@@ -9,14 +9,18 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <description>
-    <p>Troque o tema, os ícones, o cursor, o wallpaper e a barra de tarefas do seu computador vendo uma prévia de cada opção, sem precisar abrir o terminal.</p>
+    <p>Troque o tema, os ícones, o cursor, o papel de parede e a barra de tarefas do seu computador vendo uma prévia de cada opção, sem precisar abrir o terminal. Clicar só mostra a prévia: nada muda até você clicar em Aplicar.</p>
     <ul>
-      <li>Combos prontos que combinam tema, ícones, cursor e wallpaper</li>
-      <li>Loja com dezenas de temas, ícones e cursores, instalados com um clique</li>
-      <li>Barra de tarefas no estilo dock, flutuante ou clássica</li>
-      <li>Botão para voltar ao visual original a qualquer momento</li>
+      <li>Estilos prontos que combinam tema, ícones, cursor e papel de parede</li>
+      <li>Cores: escolha sua cor favorita e receba paletas com papel de parede gerado</li>
+      <li>Explorar: dezenas de temas, ícones e cursores para baixar</li>
+      <li>Barra de tarefas no estilo dock, flutuante ou clássica, e efeito de vidro</li>
+      <li>Desfazer a última mudança ou voltar ao visual original a qualquer momento</li>
     </ul>
   </description>
+  <url type="homepage">https://github.com/oh-dony/adon-studio</url>
+  <url type="bugtracker">https://github.com/oh-dony/adon-studio/issues</url>
+  <url type="vcs-browser">https://github.com/oh-dony/adon-studio</url>
   <launchable type="desktop-id">com.adonay.studio.desktop</launchable>
   <categories>
     <category>Settings</category>
